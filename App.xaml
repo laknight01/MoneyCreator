@@ -1,0 +1,150 @@
+﻿<Application x:Class="MoneyCreator.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:MoneyCreator"
+             xmlns:vm="clr-namespace:MoneyCreator.ViewModels">
+    <Application.Resources>
+        <Style x:Key="PercentButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#333"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Margin" Value="2"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <vm:InverseBooleanConverter x:Key="InverseBooleanConverter"/>
+        <vm:BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
+        <vm:InverseBooleanToVisibilityConverter x:Key="InverseBooleanToVisibilityConverter"/>
+        <Style x:Key="SharpLightRedButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#20FF0000"/>
+            <Setter Property="Foreground" Value="#FF9999"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="BorderBrush" Value="#60FF0000"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="15,5"/>
+
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" 
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="0" 
+                        Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" 
+                                      VerticalAlignment="Center"/>
+                        </Border>
+
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="#40FF0000"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="#60FF0000"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <!-- 팝업용 부드러운 그림자 효과 -->
+        <DropShadowEffect x:Key="PopBoxShadow" 
+                      Color="Black" 
+                      Direction="270" 
+                      ShadowDepth="5" 
+                      BlurRadius="15" 
+                      Opacity="0.3"/>
+
+        <!-- 확인 버튼용 스타일 (참고용) -->
+        <Style x:Key="PrimaryButton" TargetType="Button">
+            <Setter Property="Background" Value="#007ACC"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="10,5"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="4">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 공통 스위치 스타일 -->
+        <Style x:Key="SwitchToggleStyle" TargetType="ToggleButton">
+            <Setter Property="Width" Value="70"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="Background" Value="#444"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Grid>
+                            <!-- 배경 -->
+                            <Border x:Name="SwitchBackground"
+                                CornerRadius="16"
+                                Background="#555"/>
+
+                            <!-- 원 -->
+                            <Border x:Name="SwitchThumb"
+                                Width="26"
+                                Height="26"
+                                CornerRadius="13"
+                                Background="White"
+                                Margin="3"
+                                HorizontalAlignment="Left"/>
+
+                            <!-- 텍스트 -->
+                            <TextBlock x:Name="SwitchText"
+                                   Text="OFF"
+                                   Foreground="White"
+                                   FontWeight="Bold"
+                                   FontSize="11"
+                                   VerticalAlignment="Center"
+                                   HorizontalAlignment="Center"/>
+                        </Grid>
+
+                        <ControlTemplate.Triggers>
+
+                            <!-- ON -->
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="SwitchBackground"
+                                    Property="Background"
+                                    Value="#00C853"/>
+
+                                <Setter TargetName="SwitchThumb"
+                                    Property="HorizontalAlignment"
+                                    Value="Right"/>
+
+                                <Setter TargetName="SwitchText"
+                                    Property="Text"
+                                    Value="ON"/>
+                            </Trigger>
+
+                            <!-- OFF -->
+                            <Trigger Property="IsChecked" Value="False">
+                                <Setter TargetName="SwitchBackground"
+                                    Property="Background"
+                                    Value="#666"/>
+
+                                <Setter TargetName="SwitchThumb"
+                                    Property="HorizontalAlignment"
+                                    Value="Left"/>
+
+                                <Setter TargetName="SwitchText"
+                                    Property="Text"
+                                    Value="OFF"/>
+                            </Trigger>
+
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Application.Resources>
+</Application>

@@ -1,0 +1,13 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/솔루션 항목/" />
+  <Project Path="../MoneyCreator.AutoTradeCore/MoneyCreator.AutoTradeCore.csproj" />
+  <Project Path="../MoneyCreator.ML/MoneyCreator.TiRexServer.csproj" />
+  <Project Path="../MoneyCreator.Shared/MoneyCreator.Shared.csproj" />
+  <Project Path="MoneyCreator.csproj" Id="11303860-4d02-40a8-971a-2d290dba899b">
+    <Platform Solution="*|x86" Project="x86" />
+  </Project>
+</Solution>
