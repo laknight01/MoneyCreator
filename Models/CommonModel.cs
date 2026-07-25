@@ -184,6 +184,17 @@ namespace MoneyCreator.Models
         public bool IsBuy { get; set; }
     }
 
+    public class AnalysisScorePoint
+    {
+        public DateTime Time { get; set; }
+        public string Code { get; set; } = string.Empty;
+        public double Price { get; set; }
+        public double SignalScore { get; set; }
+        public string Action { get; set; } = string.Empty;
+        public string StrategyName { get; set; } = string.Empty;
+        public string Reason { get; set; } = string.Empty;
+    }
+
     public class AiResult : INotifyPropertyChanged
     {
         private string _code;

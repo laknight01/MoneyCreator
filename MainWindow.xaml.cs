@@ -1,5 +1,6 @@
 ﻿using AxKHOpenAPILib;
 using MoneyCreator.Models;
+using MoneyCreator.DataBase;
 using MoneyCreator.Service;
 using MoneyCreator.ViewModels;
 using ScottPlot;
@@ -8,6 +9,7 @@ using ScottPlot.AxisRules;
 using ScottPlot.Plottables;
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -23,6 +25,7 @@ namespace MoneyCreator
     {
         private MainWindowViewModel _vm;
         private AxKHOpenAPI _axAPI;
+        private readonly MarketApiMode _windowApiMode;
         private readonly List<double> _xs = new List<double>();
         private readonly List<double> _ps = new List<double>();
         private readonly List<double> _vs = new List<double>();
@@ -47,6 +50,17 @@ namespace MoneyCreator
         private SignalXY _upSignal;
         private SignalXY _downSignal;
         private SignalXY _volumeSignal;
+        private SignalXY _scoreSignal;
+        private readonly List<double> _scoreXs = new List<double>();
+        private readonly List<double> _scoreYs = new List<double>();
+        private DateTime _lastReplayChartRenderTime = DateTime.MinValue;
+        private DateTime _lastScoreChartRefreshAt = DateTime.MinValue;
+        private HorizontalLine _scoreZeroLine;
+        private HorizontalLine _scoreBuyLine;
+        private HorizontalLine _scoreSellLine;
+        private Crosshair _scoreCrosshair;
+        private bool _scoreChartInitialized = false;
+        private bool _hasRealAnalysisScorePoint = false;
 
         private Crosshair _crosshair;
         private HorizontalLine _openLine;
@@ -60,13 +74,16 @@ namespace MoneyCreator
         public MainWindow()
         {
             InitializeComponent();
+            RegisterAutoTradeAnalysisLogCopyShortcut();
+            RegisterMainLogCopyShortcut();
+            _windowApiMode = GlobalApi.Mode;
             //CreatePassword();
 
             if (GlobalApi.Service == null)
             {
-                if (GlobalApi.Mode == MarketApiMode.Replay)
+                if (_windowApiMode == MarketApiMode.Replay)
                 {
-                    GlobalApi.Service = new LocalReplayApiService();
+                    GlobalApi.Service = CreateReplayApiService();
 
                     // 테스트 모드는 OCX 필요 없음
                     APIHost.Visibility = Visibility.Collapsed;
@@ -83,7 +100,7 @@ namespace MoneyCreator
             this.DataContext = _vm;
             _vm.HostWindow = this;
 
-            if (GlobalApi.Mode == MarketApiMode.Real && GlobalApi.AxAPI != null)
+            if (_windowApiMode == MarketApiMode.Real && GlobalApi.AxAPI != null)
             {
                 this.APIHost.Child = GlobalApi.AxAPI;
             }
@@ -109,6 +126,12 @@ namespace MoneyCreator
             MyPlot.Plot.Grid.MajorLineColor = ScottPlot.Color.FromHex("#333333");
             MyPlot.MouseMove += MyPlot_MouseMove;
             MyPlot.MouseLeave += MyPlot_MouseLeave;
+
+            MyPlotScore.MouseMove += MyPlotScore_MouseMove;
+            MyPlotScore.MouseLeave += MyPlotScore_MouseLeave;
+
+            InitScoreChart();
+            ApplyMatchedChartLayout();
             _crosshair = MyPlot.Plot.Add.Crosshair(0, 0);
             _crosshair.IsVisible = false;
 
@@ -119,7 +142,7 @@ namespace MoneyCreator
             {
                 SearchBox.Focus();
 
-                if (GlobalApi.Mode == MarketApiMode.Real)
+                if (_windowApiMode == MarketApiMode.Real)
                 {
                     _vm.RegisterApi(GlobalApi.AxAPI);
                 }
@@ -172,12 +195,23 @@ namespace MoneyCreator
                             if (_xs.Count > 0 && latestTick.LastUpdated < _lastTickTime)
                                 return;
 
+                            if (_vm != null && _vm.IsReplayMode && _lastReplayChartRenderTime != DateTime.MinValue &&
+                                (latestTick.LastUpdated - _lastReplayChartRenderTime).TotalMilliseconds < 1000)
+                            {
+                                if (payload.Markers != null)
+                                    MergeTradeMarkers(payload.Markers);
+                                return;
+                            }
+
+                            if (_vm != null && _vm.IsReplayMode)
+                                _lastReplayChartRenderTime = latestTick.LastUpdated;
+
                             AppendTick(latestTick);
 
-                            // 실시간 분봉 갱신 때 주문마커도 같이 받은 경우에만 갱신.
-                            // Markers가 null이면 기존 마커 유지.
+                            // 실시간 갱신에서는 기존 마커를 지우지 않고 새 마커만 병합한다.
+                            // 전체 재구성은 FullRefresh에서만 수행한다.
                             if (payload.Markers != null)
-                                ApplyTradeMarkers(payload.Markers);
+                                MergeTradeMarkers(payload.Markers);
                         }
 
                         if (!IsAscendingXs())
@@ -238,7 +272,570 @@ namespace MoneyCreator
                         }), System.Windows.Threading.DispatcherPriority.Background);
                     });
                 };
+
+                _vm.RequestAnalysisScorePoint += (point) =>
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        AddAnalysisScorePoint(point);
+                    }), System.Windows.Threading.DispatcherPriority.Background);
+                };
             };
+        }
+
+        private static IMarketApiService CreateReplayApiService()
+        {
+            return new LocalReplayApiService(KiwoomApiService.Instance);
+        }
+
+        private void ApplyMatchedChartLayout()
+        {
+            // ScottPlot 내부 PlotArea 폭을 맞추기 위한 처리.
+            // 주의: Layout.Fixed(int, int, int, int) 형태는 ScottPlot 버전에 따라
+            // padding이 아니라 사각형 좌표로 해석될 수 있어 차트가 쪼그라든다.
+            // 그래서 1개 인자를 받는 PixelPadding 계열 Fixed 메서드가 있을 때만 적용한다.
+            const int left = 55;
+            const int right = 55;
+            const int bottom = 25;
+            const int top = 10;
+
+            TryApplyPixelPaddingLayout(MyPlot, left, right, bottom, top);
+            TryApplyPixelPaddingLayout(MyPlotScore, left, right, bottom, top);
+        }
+
+        private static void TryApplyPixelPaddingLayout(object plotControl, int left, int right, int bottom, int top)
+        {
+            if (plotControl == null)
+                return;
+
+            try
+            {
+                var plotProperty = plotControl.GetType().GetProperty("Plot");
+                var plot = plotProperty == null ? null : plotProperty.GetValue(plotControl, null);
+                if (plot == null)
+                    return;
+
+                var layoutProperty = plot.GetType().GetProperty("Layout");
+                var layout = layoutProperty == null ? null : layoutProperty.GetValue(plot, null);
+                if (layout == null)
+                    return;
+
+                var fixedMethods = layout.GetType()
+                    .GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)
+                    .Where(x => x.Name == "Fixed")
+                    .ToList();
+
+                foreach (var method in fixedMethods)
+                {
+                    var parameters = method.GetParameters();
+                    if (parameters.Length != 1)
+                        continue;
+
+                    var parameterType = parameters[0].ParameterType;
+                    string typeName = parameterType.Name ?? string.Empty;
+
+                    if (!typeName.Contains("Padding") && !typeName.Contains("Margin"))
+                        continue;
+
+                    object padding = CreatePaddingObject(parameterType, left, right, bottom, top);
+                    if (padding == null)
+                        continue;
+
+                    method.Invoke(layout, new[] { padding });
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[차트 레이아웃 맞춤 실패] " + ex.Message);
+            }
+        }
+
+        private static object CreatePaddingObject(Type paddingType, int left, int right, int bottom, int top)
+        {
+            foreach (var ctor in paddingType.GetConstructors())
+            {
+                var parameters = ctor.GetParameters();
+                if (parameters.Length != 4)
+                    continue;
+
+                try
+                {
+                    var args = new object[parameters.Length];
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        int value = ResolvePaddingValue(parameters[i].Name, i, left, right, bottom, top);
+                        args[i] = ConvertPaddingValue(parameters[i].ParameterType, value);
+                    }
+
+                    return ctor.Invoke(args);
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        private static int ResolvePaddingValue(string name, int index, int left, int right, int bottom, int top)
+        {
+            name = string.IsNullOrWhiteSpace(name) ? string.Empty : name.ToLowerInvariant();
+
+            if (name.Contains("left"))
+                return left;
+
+            if (name.Contains("right"))
+                return right;
+
+            if (name.Contains("bottom"))
+                return bottom;
+
+            if (name.Contains("top"))
+                return top;
+
+            switch (index)
+            {
+                case 0: return left;
+                case 1: return right;
+                case 2: return bottom;
+                case 3: return top;
+                default: return 0;
+            }
+        }
+
+        private static object ConvertPaddingValue(Type targetType, int value)
+        {
+            if (targetType == typeof(float))
+                return (float)value;
+
+            if (targetType == typeof(double))
+                return (double)value;
+
+            if (targetType == typeof(int))
+                return value;
+
+            return Convert.ChangeType(value, targetType);
+        }
+
+        private void InitScoreChart()
+        {
+            if (_scoreChartInitialized)
+                return;
+
+            MyPlotScore.UserInputProcessor.IsEnabled = false;
+            MyPlotScore.Plot.Clear();
+
+            var fontColor = ScottPlot.Color.FromHex("#CCCCCC");
+            MyPlotScore.Plot.FigureBackground.Color = ScottPlot.Color.FromHex("#1E1E1E");
+            MyPlotScore.Plot.DataBackground.Color = ScottPlot.Color.FromHex("#101820");
+            MyPlotScore.Plot.DataBorder.Color = ScottPlot.Color.FromHex("#020202");
+            MyPlotScore.Plot.Grid.MajorLineColor = ScottPlot.Color.FromHex("#333333");
+            MyPlotScore.Plot.Axes.Bottom.TickLabelStyle.ForeColor = fontColor;
+            MyPlotScore.Plot.Axes.Left.TickLabelStyle.ForeColor = fontColor;
+
+            _scoreSignal = MyPlotScore.Plot.Add.SignalXY(Array.Empty<double>(), Array.Empty<double>());
+            _scoreSignal.LineWidth = 1.5f;
+            _scoreSignal.Color = ScottPlot.Color.FromHex("#FFD966");
+
+            _scoreZeroLine = MyPlotScore.Plot.Add.HorizontalLine(0);
+            _scoreZeroLine.LineStyle.Pattern = ScottPlot.LinePattern.Dotted;
+            _scoreZeroLine.Color = ScottPlot.Color.FromHex("#888888");
+
+            // 실제 매매 기준선은 AutoTrading Core의 최종 점수 기준을 따라간다.
+            // 고정 +25/-20 기준선은 통합 DecisionScore 기준과 어긋날 수 있어 초기에는 숨긴다.
+            _scoreBuyLine = MyPlotScore.Plot.Add.HorizontalLine(0);
+            _scoreBuyLine.LineStyle.Pattern = ScottPlot.LinePattern.Dashed;
+            _scoreBuyLine.Color = ScottPlot.Color.FromHex("#3CB371");
+            _scoreBuyLine.IsVisible = false;
+
+            _scoreSellLine = MyPlotScore.Plot.Add.HorizontalLine(0);
+            _scoreSellLine.LineStyle.Pattern = ScottPlot.LinePattern.Dashed;
+            _scoreSellLine.Color = ScottPlot.Color.FromHex("#CD5C5C");
+            _scoreSellLine.IsVisible = false;
+
+            _scoreCrosshair = MyPlotScore.Plot.Add.Crosshair(0, 0);
+            _scoreCrosshair.IsVisible = false;
+
+            MyPlotScore.Plot.Axes.Left.Min = -100;
+            MyPlotScore.Plot.Axes.Left.Max = 100;
+
+            _scoreChartInitialized = true;
+            ApplyMatchedChartLayout();
+        }
+
+        private void AddAnalysisScorePoint(AnalysisScorePoint point)
+        {
+            if (point == null || point.Time == DateTime.MinValue)
+                return;
+
+            InitScoreChart();
+
+            double x = point.Time.ToOADate();
+            double y = point.SignalScore;
+
+            if (y < -100) y = -100;
+            if (y > 100) y = 100;
+
+            // 분봉 차트 기준으로 0점 seed가 먼저 들어간 상태에서 실제 분석값이 들어오면,
+            // 해당 시점 이후의 0점 placeholder는 제거하고 실제 점수만 이어 붙인다.
+            if (!_hasRealAnalysisScorePoint)
+            {
+                RemoveScorePlaceholdersFrom(x);
+                _hasRealAnalysisScorePoint = true;
+            }
+
+            int insertIndex = FindScoreInsertIndex(x);
+
+            if (insertIndex < _scoreXs.Count && _scoreXs[insertIndex] == x)
+            {
+                _scoreYs[insertIndex] = y;
+                UpdateScoreThresholdLines(point);
+                RefreshScoreChart();
+                return;
+            }
+
+            _scoreXs.Insert(insertIndex, x);
+            _scoreYs.Insert(insertIndex, y);
+            TrimScoreChartPointsIfNeeded();
+            UpdateScoreThresholdLines(point);
+            RefreshScoreChart();
+        }
+
+        private void UpdateScoreThresholdLines(AnalysisScorePoint point)
+        {
+            if (point == null || _scoreBuyLine == null || _scoreSellLine == null)
+                return;
+
+            double? buyThreshold;
+            double? sellThreshold;
+            TryResolveScoreThresholds(point, out buyThreshold, out sellThreshold);
+
+            if (!buyThreshold.HasValue || !sellThreshold.HasValue)
+            {
+                double? fallbackBuy;
+                double? fallbackSell;
+                TryResolveScoreThresholdsFromViewModel(out fallbackBuy, out fallbackSell);
+
+                if (!buyThreshold.HasValue)
+                    buyThreshold = fallbackBuy;
+
+                if (!sellThreshold.HasValue)
+                    sellThreshold = fallbackSell;
+            }
+
+            if (buyThreshold.HasValue)
+            {
+                _scoreBuyLine.Y = ClampScoreAxisValue(buyThreshold.Value);
+                _scoreBuyLine.IsVisible = true;
+            }
+
+            if (sellThreshold.HasValue)
+            {
+                _scoreSellLine.Y = ClampScoreAxisValue(sellThreshold.Value);
+                _scoreSellLine.IsVisible = true;
+            }
+        }
+
+        private static bool TryResolveScoreThresholds(
+            AnalysisScorePoint point,
+            out double? buyThreshold,
+            out double? sellThreshold)
+        {
+            buyThreshold = null;
+            sellThreshold = null;
+
+            if (point == null)
+                return false;
+
+            string text = string.Format(
+                "{0} {1} {2}",
+                point.Action ?? string.Empty,
+                point.StrategyName ?? string.Empty,
+                point.Reason ?? string.Empty);
+
+            double value;
+            if (TryParseThresholdAfter(text, "BuyDecisionScore", out value) ||
+                TryParseThresholdAfter(text, "매수기준", out value))
+            {
+                buyThreshold = Math.Abs(value);
+            }
+
+            if (TryParseThresholdAfter(text, "SellDecisionScore", out value) ||
+                TryParseThresholdAfter(text, "매도기준", out value))
+            {
+                sellThreshold = value > 0 ? -value : value;
+            }
+
+            if (!buyThreshold.HasValue && !sellThreshold.HasValue && TryParseThresholdAfter(text, string.Empty, out value))
+            {
+                if (value >= 0)
+                    buyThreshold = value;
+                else
+                    sellThreshold = value;
+            }
+
+            return buyThreshold.HasValue || sellThreshold.HasValue;
+        }
+
+        private bool TryResolveScoreThresholdsFromViewModel(out double? buyThreshold, out double? sellThreshold)
+        {
+            buyThreshold = null;
+            sellThreshold = null;
+
+            object vm = _vm;
+            if (vm == null)
+                return false;
+
+            double value;
+            if (TryReadViewModelScoreThreshold(vm, "AutoTradeChartBuyThreshold", out value))
+                buyThreshold = Math.Abs(value);
+
+            if (TryReadViewModelScoreThreshold(vm, "AutoTradeChartSellThreshold", out value))
+                sellThreshold = value > 0 ? -value : value;
+
+            return buyThreshold.HasValue || sellThreshold.HasValue;
+        }
+
+        private static bool TryReadViewModelScoreThreshold(object viewModel, string propertyName, out double value)
+        {
+            value = 0;
+
+            if (viewModel == null || string.IsNullOrWhiteSpace(propertyName))
+                return false;
+
+            try
+            {
+                var property = viewModel.GetType().GetProperty(propertyName);
+                if (property == null)
+                    return false;
+
+                object raw = property.GetValue(viewModel, null);
+                if (raw == null)
+                    return false;
+
+                value = Convert.ToDouble(raw);
+                return !double.IsNaN(value) && !double.IsInfinity(value) && value != 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryParseThresholdAfter(string text, string marker, out double value)
+        {
+            value = 0;
+
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+
+            string searchText = text;
+            if (!string.IsNullOrWhiteSpace(marker))
+            {
+                int markerIndex = text.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (markerIndex < 0)
+                    return false;
+
+                searchText = text.Substring(markerIndex);
+            }
+
+            Match match = Regex.Match(
+                searchText,
+                @"Threshold\s*=\s*(?<value>[+-]?\d+(?:\.\d+)?)",
+                RegexOptions.IgnoreCase);
+
+            if (!match.Success)
+                return false;
+
+            return double.TryParse(match.Groups["value"].Value, out value);
+        }
+
+        private static double ClampScoreAxisValue(double value)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value))
+                return 0;
+
+            if (value < -100)
+                return -100;
+
+            if (value > 100)
+                return 100;
+
+            return value;
+        }
+
+        private int FindScoreInsertIndex(double x)
+        {
+            int index = _scoreXs.BinarySearch(x);
+            if (index >= 0)
+                return index;
+
+            return ~index;
+        }
+
+        private void RemoveScorePlaceholdersFrom(double x)
+        {
+            for (int i = _scoreXs.Count - 1; i >= 0; i--)
+            {
+                if (_scoreXs[i] < x)
+                    continue;
+
+                _scoreXs.RemoveAt(i);
+                _scoreYs.RemoveAt(i);
+            }
+        }
+
+        private void SeedScoreChartZerosFromPriceChart()
+        {
+            if (_xs.Count == 0)
+                return;
+
+            InitScoreChart();
+
+            _scoreXs.Clear();
+            _scoreYs.Clear();
+            _hasRealAnalysisScorePoint = false;
+
+            string code = _vm != null && _vm.Context != null && !string.IsNullOrWhiteSpace(_vm.Context.Code)
+                ? _vm.Context.Code
+                : string.Empty;
+
+            for (int i = 0; i < _xs.Count; i++)
+            {
+                double x = _xs[i];
+                double price = i < _ps.Count ? _ps[i] : 0;
+                DateTime time = DateTime.FromOADate(x);
+
+                _scoreXs.Add(x);
+                _scoreYs.Add(0);
+            }
+
+            RefreshScoreChart(true);
+        }
+
+        private void TrimScoreChartPointsIfNeeded()
+        {
+            const int maxScorePoints = 30000;
+            if (_scoreXs.Count <= maxScorePoints)
+                return;
+
+            int removeCount = _scoreXs.Count - maxScorePoints;
+            _scoreXs.RemoveRange(0, removeCount);
+            _scoreYs.RemoveRange(0, removeCount);
+        }
+
+        private void RefreshScoreChart()
+        {
+            RefreshScoreChart(false);
+        }
+
+        private void RefreshScoreChart(bool force)
+        {
+            if (_scoreSignal == null || _scoreXs.Count == 0)
+                return;
+
+            DateTime now = DateTime.Now;
+            if (!force &&
+                _lastScoreChartRefreshAt != DateTime.MinValue &&
+                (now - _lastScoreChartRefreshAt).TotalMilliseconds < 250)
+                return;
+
+            _lastScoreChartRefreshAt = now;
+
+            _scoreSignal.Data = new ScottPlot.DataSources.SignalXYSourceDoubleArray(
+                _scoreXs.ToArray(),
+                _scoreYs.ToArray());
+
+            MyPlotScore.Plot.Axes.Left.Min = -100;
+            MyPlotScore.Plot.Axes.Left.Max = 100;
+
+            double minX;
+            double maxX;
+            ResolveScoreAxisRange(out minX, out maxX);
+
+            MyPlotScore.Plot.Axes.Bottom.Min = minX;
+            MyPlotScore.Plot.Axes.Bottom.Max = maxX;
+
+            UpdateScoreAxisTicks();
+            MyPlotScore.Refresh();
+        }
+
+        private void ResolveScoreAxisRange(out double minX, out double maxX)
+        {
+            if (_xs.Count > 0)
+            {
+                minX = _xs[0];
+                maxX = _xs[_xs.Count - 1];
+            }
+            else
+            {
+                minX = _scoreXs[0];
+                maxX = _scoreXs[_scoreXs.Count - 1];
+            }
+
+            if (minX == maxX)
+            {
+                minX = DateTime.FromOADate(minX).AddMinutes(-1).ToOADate();
+                maxX = DateTime.FromOADate(maxX).AddMinutes(1).ToOADate();
+            }
+        }
+
+        private void UpdateScoreAxisTicks()
+        {
+            if (_xs.Count == 0 && _scoreXs.Count == 0)
+                return;
+
+            double startOa;
+            double endOa;
+            ResolveScoreAxisRange(out startOa, out endOa);
+
+            DateTime startTime = DateTime.FromOADate(startOa);
+            DateTime endTime = DateTime.FromOADate(endOa);
+
+            var manualTicks = new ScottPlot.TickGenerators.NumericManual();
+
+            for (DateTime dt = startTime; dt <= endTime; dt = dt.AddMinutes(30))
+                manualTicks.Add(new ScottPlot.Tick(dt.ToOADate(), dt.ToString("HH:mm")));
+
+            manualTicks.Add(new ScottPlot.Tick(endTime.ToOADate(), endTime.ToString("HH:mm")));
+
+            MyPlotScore.Plot.Axes.Bottom.TickGenerator = manualTicks;
+            MyPlotScore.Plot.Axes.Bottom.TickLabelStyle.ForeColor = ScottPlot.Color.FromHex("#CCCCCC");
+        }
+
+        private void ResetScoreChart()
+        {
+            _scoreXs.Clear();
+            _scoreYs.Clear();
+            _hasRealAnalysisScorePoint = false;
+            _lastReplayChartRenderTime = DateTime.MinValue;
+            _lastScoreChartRefreshAt = DateTime.MinValue;
+
+            if (_scoreSignal != null)
+                _scoreSignal.Data = new ScottPlot.DataSources.SignalXYSourceDoubleArray(Array.Empty<double>(), Array.Empty<double>());
+
+            if (_scoreCrosshair != null)
+                _scoreCrosshair.IsVisible = false;
+
+            if (ScoreHoverBorder != null)
+                ScoreHoverBorder.Visibility = Visibility.Collapsed;
+
+            if (_scoreChartInitialized)
+            {
+                MyPlotScore.Plot.Axes.Left.Min = -100;
+                MyPlotScore.Plot.Axes.Left.Max = 100;
+
+                if (_scoreBuyLine != null)
+                    _scoreBuyLine.IsVisible = false;
+
+                if (_scoreSellLine != null)
+                    _scoreSellLine.IsVisible = false;
+
+                MyPlotScore.Plot.Axes.Bottom.Min = DateTime.Now.ToOADate();
+                MyPlotScore.Plot.Axes.Bottom.Max = DateTime.Now.AddMinutes(30).ToOADate();
+                MyPlotScore.Refresh();
+            }
         }
 
         private List<TrackedSymbol> NormalizeChartCandlesForFullRefresh(List<TrackedSymbol> candles)
@@ -381,12 +978,23 @@ namespace MoneyCreator
 
             _lastTickTime = sortedList[sortedList.Count - 1].LastUpdated;
 
+            SeedScoreChartZerosFromPriceChart();
+
         }
 
         private void ApplyTradeMarkers(List<TradeMarkerInfo> markers)
         {
             ClearTradeMarkers();
 
+            if (markers == null || markers.Count == 0)
+                return;
+
+            foreach (var marker in markers)
+                AddTradeMarker(marker.Time, marker.Price, marker.IsBuy);
+        }
+
+        private void MergeTradeMarkers(List<TradeMarkerInfo> markers)
+        {
             if (markers == null || markers.Count == 0)
                 return;
 
@@ -447,6 +1055,7 @@ namespace MoneyCreator
             MyPlot.Plot.Axes.Rules.Add(_volumeLockRule);
 
             _chartInitialized = true;
+            ApplyMatchedChartLayout();
         }
 
         private void AddTradeMarker(DateTime time, double price, bool isBuy)
@@ -457,6 +1066,9 @@ namespace MoneyCreator
             InitChart();
 
             double x = time.ToOADate();
+
+            if (HasTradeMarker(x, price, isBuy))
+                return;
 
             if (isBuy)
             {
@@ -471,6 +1083,20 @@ namespace MoneyCreator
 
             RebuildTradeMarkerPlots();
             MyPlot.Refresh();
+        }
+
+        private bool HasTradeMarker(double x, double price, bool isBuy)
+        {
+            var xs = isBuy ? _buyMarkerXs : _sellMarkerXs;
+            var ys = isBuy ? _buyMarkerYs : _sellMarkerYs;
+
+            for (int i = 0; i < xs.Count && i < ys.Count; i++)
+            {
+                if (Math.Abs(xs[i] - x) < 0.000000001 && Math.Abs(ys[i] - price) < 0.0001)
+                    return true;
+            }
+
+            return false;
         }
 
         private void ClearTradeMarkers()
@@ -637,6 +1263,97 @@ namespace MoneyCreator
                 MyPlot.Refresh();
             }
         }
+
+        private void MyPlotScore_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (_scoreCrosshair == null || _scoreXs == null || _scoreYs == null)
+                return;
+
+            int count = Math.Min(_scoreXs.Count, _scoreYs.Count);
+            if (count <= 0)
+                return;
+
+            Point mousePosition = e.GetPosition(MyPlotScore);
+            ScottPlot.Pixel pixel = new ScottPlot.Pixel(
+                (float)mousePosition.X,
+                (float)mousePosition.Y);
+            ScottPlot.Coordinates mouseCoordinates =
+                MyPlotScore.Plot.GetCoordinates(pixel);
+
+            int nearestIndex = 0;
+            double nearestDistance = double.MaxValue;
+
+            for (int i = 0; i < count; i++)
+            {
+                double distance = Math.Abs(_scoreXs[i] - mouseCoordinates.X);
+                if (distance < nearestDistance)
+                {
+                    nearestDistance = distance;
+                    nearestIndex = i;
+                }
+            }
+
+            double x = _scoreXs[nearestIndex];
+            double score = _scoreYs[nearestIndex];
+
+            _scoreCrosshair.X = x;
+            _scoreCrosshair.Y = score;
+            _scoreCrosshair.IsVisible = true;
+
+            DateTime time;
+            try
+            {
+                time = DateTime.FromOADate(x);
+            }
+            catch
+            {
+                time = DateTime.MinValue;
+            }
+
+            if (time == DateTime.MinValue)
+            {
+                ScoreLabel.Text = string.Format(
+                    "점수: {0:+0.##;-0.##;0}",
+                    score);
+            }
+            else
+            {
+                ScoreLabel.Text = string.Format(
+                    "[{0:HH:mm:ss.fff}] 점수: {1:+0.##;-0.##;0}",
+                    time,
+                    score);
+            }
+
+            double left = mousePosition.X + 15.0;
+            double top = mousePosition.Y + 15.0;
+
+            const double estimatedWidth = 190.0;
+            const double estimatedHeight = 34.0;
+
+            if (left + estimatedWidth > MyPlotScore.ActualWidth)
+                left = Math.Max(0.0, mousePosition.X - estimatedWidth - 10.0);
+
+            if (top + estimatedHeight > MyPlotScore.ActualHeight)
+                top = Math.Max(0.0, mousePosition.Y - estimatedHeight - 10.0);
+
+            Canvas.SetLeft(ScoreHoverBorder, left);
+            Canvas.SetTop(ScoreHoverBorder, top);
+            ScoreHoverBorder.Visibility = Visibility.Visible;
+
+            MyPlotScore.Refresh();
+        }
+
+        private void MyPlotScore_MouseLeave(object sender, MouseEventArgs e)
+        {
+            if (_scoreCrosshair != null)
+                _scoreCrosshair.IsVisible = false;
+
+            if (ScoreHoverBorder != null)
+                ScoreHoverBorder.Visibility = Visibility.Collapsed;
+
+            MyPlotScore.Refresh();
+        }
+
         private void ResetChart()
         {
             // =========================
@@ -649,6 +1366,7 @@ namespace MoneyCreator
             _downPs.Clear();
 
             ClearTradeMarkers();
+            ResetScoreChart();
 
             _lastTickTime = DateTime.MinValue;
             _tickCount = 0;
@@ -806,6 +1524,144 @@ namespace MoneyCreator
                 }
             }
         }
+
+
+        private void RegisterAutoTradeAnalysisLogCopyShortcut()
+        {
+            if (AutoTradeAnalysisLogListBox == null)
+                return;
+
+            AutoTradeAnalysisLogListBox.CommandBindings.Add(new CommandBinding(
+                ApplicationCommands.Copy,
+                (s, e) =>
+                {
+                    e.Handled = CopySelectedAutoTradeAnalysisLogs();
+                },
+                (s, e) =>
+                {
+                    e.CanExecute = AutoTradeAnalysisLogListBox.SelectedItems != null && AutoTradeAnalysisLogListBox.SelectedItems.Count > 0;
+                    e.Handled = true;
+                }));
+
+            AutoTradeAnalysisLogListBox.InputBindings.Add(new KeyBinding(
+                ApplicationCommands.Copy,
+                new KeyGesture(Key.C, ModifierKeys.Control)));
+        }
+
+        private void AutoTradeAnalysisLogListBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.C && e.SystemKey != Key.C)
+                return;
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
+                return;
+
+            if (CopySelectedAutoTradeAnalysisLogs())
+                e.Handled = true;
+        }
+
+        private bool CopySelectedAutoTradeAnalysisLogs()
+        {
+            var listBox = AutoTradeAnalysisLogListBox;
+            if (listBox == null)
+                return false;
+
+            var lines = new List<string>();
+
+            if (listBox.SelectedItems != null && listBox.SelectedItems.Count > 0)
+            {
+                foreach (var item in listBox.SelectedItems)
+                {
+                    string text = item == null ? string.Empty : item.ToString();
+                    if (!string.IsNullOrEmpty(text))
+                        lines.Add(text);
+                }
+            }
+
+            if (lines.Count == 0 && listBox.SelectedItem != null)
+            {
+                string text = listBox.SelectedItem.ToString();
+                if (!string.IsNullOrEmpty(text))
+                    lines.Add(text);
+            }
+
+            if (lines.Count == 0)
+                return false;
+
+            Clipboard.SetText(string.Join(Environment.NewLine, lines));
+            return true;
+        }
+
+        private void RegisterMainLogCopyShortcut()
+        {
+            if (MainLogListBox == null)
+                return;
+
+            MainLogListBox.CommandBindings.Add(new CommandBinding(
+                ApplicationCommands.Copy,
+                (s, e) =>
+                {
+                    e.Handled = CopySelectedMainLogs();
+                },
+                (s, e) =>
+                {
+                    e.CanExecute = MainLogListBox.SelectedItems != null && MainLogListBox.SelectedItems.Count > 0;
+                    e.Handled = true;
+                }));
+
+            MainLogListBox.InputBindings.Add(new KeyBinding(
+                ApplicationCommands.Copy,
+                new KeyGesture(Key.C, ModifierKeys.Control)));
+        }
+
+        private void MainLogListBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.C && e.SystemKey != Key.C)
+                return;
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
+                return;
+
+            if (CopySelectedMainLogs())
+                e.Handled = true;
+        }
+
+        private bool CopySelectedMainLogs()
+        {
+            return CopySelectedListBoxItems(MainLogListBox);
+        }
+
+        private bool CopySelectedListBoxItems(ListBox listBox)
+        {
+            if (listBox == null)
+                return false;
+
+            var lines = new List<string>();
+
+            if (listBox.SelectedItems != null && listBox.SelectedItems.Count > 0)
+            {
+                foreach (var item in listBox.SelectedItems)
+                {
+                    string text = item == null ? string.Empty : item.ToString();
+                    if (!string.IsNullOrEmpty(text))
+                        lines.Add(text);
+                }
+            }
+
+            if (lines.Count == 0 && listBox.SelectedItem != null)
+            {
+                string text = listBox.SelectedItem.ToString();
+                if (!string.IsNullOrEmpty(text))
+                    lines.Add(text);
+            }
+
+            if (lines.Count == 0)
+                return false;
+
+            Clipboard.SetText(string.Join(Environment.NewLine, lines));
+            return true;
+        }
+
 
         private void CreatePassword()
         {

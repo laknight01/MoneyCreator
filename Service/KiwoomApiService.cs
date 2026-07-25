@@ -37,7 +37,40 @@ namespace MoneyCreator.Service
         private readonly ConcurrentDictionary<string, DateTime> _lastOrderHistoryRequestAt = new ConcurrentDictionary<string, DateTime>();
         private readonly ConcurrentDictionary<string, string> _symbolScreenTokens = new ConcurrentDictionary<string, string>();
         private readonly ConcurrentDictionary<string, int> _minuteRequestCycleMap = new ConcurrentDictionary<string, int>();
+        private readonly ConcurrentDictionary<string, int> _programTradeRequestCycleMap = new ConcurrentDictionary<string, int>();
         private readonly ConcurrentDictionary<string, string> _orderWindowMap = new ConcurrentDictionary<string, string>();
+        private readonly ConcurrentDictionary<string, List<ProgramTradeInfo>> _programTradeBuffers = new ConcurrentDictionary<string, List<ProgramTradeInfo>>();
+        private readonly object _programTradeLock = new object();
+
+        private const string FullSymbolRealtimeFids =
+            "10;11;12;13;15;20;228;" +
+            "41;42;43;44;45;46;47;48;49;50;" +
+            "51;52;53;54;55;56;57;58;59;60;" +
+            "61;62;63;64;65;66;67;68;69;70;" +
+            "71;72;73;74;75;76;77;78;79;80;" +
+            "121;125;" +
+            "202;204;206;208;210;211;212;213;214";
+        // 일반 창/잔고 감시 모두 종목별 통합 등록부의 FullSymbolRealtimeFids 하나만 사용한다.
+        private const int RealtimeRegistrationRetryDelayMilliseconds = 1000;
+        private const int RealtimeRegistrationMaxDelayedRetries = 2;
+        private const int ProgramRealtimeInitialHealthCheckSeconds = 120;
+
+        private readonly ConcurrentDictionary<string, bool> _realtimeRegistrationRetryPending =
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, int> _realtimeRegistrationRetryCount =
+            new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, bool> _realtimeRegistrationProgramHealthWatchRequested =
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, DateTime> _fullRealtimeRegisteredAtByCode =
+            new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, bool> _programRealtimeSeenSinceRegistration =
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, bool> _programRealtimeHealthRecoveryAttempted =
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        // 실제 키움 SetRealReg 상태는 종목별 1개만 유지한다.
+        // _windowSubscriptions는 일반 창/HOLDING 소비자 목록이고, 이 맵은 서버 등록 성공 상태다.
+        private readonly ConcurrentDictionary<string, bool> _unifiedSymbolRealtimeRegistered =
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
         public event Action<bool> OnLogin;
         public event Action<string, string> OnLog;
@@ -50,11 +83,14 @@ namespace MoneyCreator.Service
         public event Action<string, HogaData> OnHogaReceived;
         public event Action<string, long> OnBalanceUpdated; // windowId와 balance를 전달
         public event Action<string, List<HoldingInfo>> OnHoldingsReceived; //보유주식 정보 전달
+        public event Action<string, string, int, double> OnPositionBalanceChanged; // code, name, absoluteQty, averagePrice
         public event Action<string, List<OrderInfo>> OnOrdersReceived; // 주문내역 정보 전달
         public event Action<string, List<OrderInfo>> OnUnfilledOrdersReceived; // 미체결 주문내역 정보 전달
         public event Action<string> OnGlobalUpdateRequired; //주문
         public event Action<string, string, string, string, int, double> OnOrderFilled;
         public event Action<MarketIndexInfo> OnMarketIndexReceived;
+        public event Action OnConnectionLost;
+        public event Action OnReconnected;
         // code, name, filledQty, filledPrice
         public event Action<TrackedSymbol> OnInventoryTickReceived; //보유주 정보담기
         // ============================================================
@@ -62,6 +98,7 @@ namespace MoneyCreator.Service
         // ============================================================
         public event Action<string, string, List<MinuteCandleRecord>, bool> OnMinuteHistoryReceived;
         public event Action<string, string, List<TrackedSymbol>, bool> OnRecentTicksReceived;
+        public event Action<string, ProgramTradeInfo, ProgramFlowSnapshotRecord> OnProgramTradeReceived;
 
         // ============================================================
         // [추가] DB Manager 외부 공유용. ViewModel에서 별도 StockDbManager를 만들지 않게 하기 위함.
@@ -80,9 +117,55 @@ namespace MoneyCreator.Service
         public enum MarketStatus { None, PreMarket, MarketOpen, AfterMarket }
         public MarketStatus CurrentMarketStatus { get; private set; } = MarketStatus.None;
 
+        public enum MarketSafetyState
+        {
+            Normal,
+            HaltSuspected,
+            CircuitBreaker,
+            RecoveryCooldown
+        }
+
+        private readonly object _marketSafetyLock = new object();
+        private readonly ConcurrentDictionary<string, DateTime> _lastStockTickReceivedAt = new ConcurrentDictionary<string, DateTime>();
+        private DateTime _lastAnyStockTickReceivedAt = DateTime.MinValue;
+        private DateTime _marketSafetyBlockBuyUntil = DateTime.MinValue;
+        private DateTime _marketSafetyUpdatedAt = DateTime.MinValue;
+        private DateTime _lastMarketSafetyLogAt = DateTime.MinValue;
+        private DateTime _lastExpectedAuctionLogAt = DateTime.MinValue;
+        private DateTime _lastMarketSafetyRegularOpenResetDate = DateTime.MinValue;
+        private double _latestKospiChangeRate = 0;
+        private double _latestKosdaqChangeRate = 0;
+
+        private const int MarketSafetyTickStopSeconds = 20;
+        private const int MarketSafetyRecoveryCooldownMinutes = 5;
+        private const int MarketSafetyCircuitBreakerBlockMinutes = 40;
+        private const int MarketSafetyExpectedAuctionCooldownMinutes = 5;
+        private static readonly TimeSpan RegularStockRealtimeStartTime = new TimeSpan(9, 0, 0);
+        private static readonly TimeSpan RegularStockRealtimeEndTime = new TimeSpan(15, 20, 0);
+
+        public MarketSafetyState CurrentMarketSafetyState { get; private set; } = MarketSafetyState.Normal;
+        public string CurrentMarketSafetyReason { get; private set; } = string.Empty;
+        public DateTime MarketSafetyBlockBuyUntil => _marketSafetyBlockBuyUntil;
+
         private int _marketIndexRegistered = 0;
         private int _activeTrCount = 0;
         public int ActiveTrCount => _activeTrCount;
+
+        private System.Threading.Timer _connectionMonitorTimer;
+        private readonly object _connectionMonitorLock = new object();
+        private int _connectionMonitorStarted;
+        private int _connectionMonitorStopped;
+        private int _kiwoomComShutdownInProgress;
+        private int _shutdownGuardAttached;
+        private int _connectionLostRaised;
+        private int _hasConnectedOnce;
+        private int _reconnectInProgress;
+        private int _disconnectHitCount;
+        private DateTime _lastReconnectAttemptAt = DateTime.MinValue;
+
+        private const int ConnectionMonitorIntervalMilliseconds = 5000;
+        private const int ConnectionLostConfirmCount = 2;
+        private const int ReconnectRetrySeconds = 10;
 
         private int _screenSeed = 1000;
         private int SafeInt(string value)
@@ -136,7 +219,8 @@ namespace MoneyCreator.Service
             return requestType == "PREV" ||
                    requestType == "DETAIL" ||
                    requestType == "MINUTE" ||
-                   requestType == "RECENT_TICKS";
+                   requestType == "RECENT_TICKS" ||
+                   requestType == "PROGRAM_TRADE";
         }
 
         private string BuildOrderRouteKey(string code, int orderType)
@@ -195,6 +279,11 @@ namespace MoneyCreator.Service
         public void SetApiInstance(AxKHOpenAPI api)
         {
             if (_api != null) return;
+
+            Interlocked.Exchange(ref _kiwoomComShutdownInProgress, 0);
+            Interlocked.Exchange(ref _connectionMonitorStopped, 0);
+            AttachApplicationShutdownGuard();
+
             _api = api;
             _api.OnEventConnect += Api_OnEventConnect;
             _api.OnReceiveTrCondition += Api_OnReceiveTrCondition;
@@ -202,7 +291,9 @@ namespace MoneyCreator.Service
             _api.OnReceiveRealCondition += Api_OnReceiveRealCondition;
             _api.OnReceiveTrData += Api_OnReceiveTrData;
             _api.OnReceiveChejanData += Api_OnReceiveChejanData;
+            _api.OnReceiveMsg += Api_OnReceiveMsg;
 
+            StartConnectionMonitor();
         }
         private void Api_OnReceiveChejanData(object sender, _DKHOpenAPIEvents_OnReceiveChejanDataEvent e)
         {
@@ -214,16 +305,16 @@ namespace MoneyCreator.Service
                 string status = _api.GetChejanData(913).Trim();
                 string orderType = _api.GetChejanData(905).Trim();
 
-                int.TryParse(_api.GetChejanData(911).Trim(), out int totalFilledQty);
-                int.TryParse(_api.GetChejanData(911).Trim(), out int filledQty);
-                int.TryParse(_api.GetChejanData(902).Trim(), out int remainQty);
-                double.TryParse(_api.GetChejanData(910).Trim(), out double filledPrice);
+                int totalFilledQty = SafeInt(_api.GetChejanData(911));
+                int filledQty = SafeInt(_api.GetChejanData(911));
+                int remainQty = SafeInt(_api.GetChejanData(902));
+                double filledPrice = SafeDouble(_api.GetChejanData(910));
 
                 string orderNo = _api.GetChejanData(9203).Trim();
                 string rawOrderTime = _api.GetChejanData(908).Trim();
 
-                int.TryParse(_api.GetChejanData(900).Trim(), out int orderQty);
-                double.TryParse(_api.GetChejanData(901).Trim(), out double orderPrice);
+                int orderQty = SafeInt(_api.GetChejanData(900));
+                double orderPrice = SafeDouble(_api.GetChejanData(901));
 
                 OrderStatus orderStatus = ParseOrderStatus(status, orderType, filledQty, remainQty);
 
@@ -276,8 +367,13 @@ namespace MoneyCreator.Service
             }
             else if (e.sGubun == "1")
             {
-                int.TryParse(_api.GetChejanData(930).Trim(), out int qty);
-                double.TryParse(_api.GetChejanData(931).Trim(), out double avgPrice);
+                // Balance Chejan is the fastest authoritative source for the absolute position.
+                // Do not wait for the serial account TR queue before clearing a fully sold holding.
+                int qty = SafeInt(_api.GetChejanData(930));
+                double avgPrice = SafeDouble(_api.GetChejanData(931));
+
+                if (!string.IsNullOrWhiteSpace(code))
+                    OnPositionBalanceChanged?.Invoke(code, name, qty, avgPrice);
             }
         }
         private string NormalizeOrderTime(string raw)
@@ -354,47 +450,600 @@ namespace MoneyCreator.Service
             return OrderStatus.None;
         }
 
+        private bool IsRealtimeApiReady()
+        {
+            return _api != null &&
+                   !_api.IsDisposed &&
+                   _api.IsHandleCreated &&
+                   !IsKiwoomComShutdownInProgress();
+        }
+
+        private static string BuildRealtimeRegistrationKey(string screenNo, string code)
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}|{1}",
+                string.IsNullOrWhiteSpace(screenNo) ? "-" : screenNo.Trim(),
+                string.IsNullOrWhiteSpace(code) ? "-" : code.Trim());
+        }
+
+        private void ClearProgramRealtimeHealthState(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            _fullRealtimeRegisteredAtByCode.TryRemove(code, out _);
+            _programRealtimeSeenSinceRegistration.TryRemove(code, out _);
+            _programRealtimeHealthRecoveryAttempted.TryRemove(code, out _);
+        }
+
+        private void StartProgramRealtimeHealthWatch(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            _fullRealtimeRegisteredAtByCode[code] = DateTime.Now;
+            _programRealtimeSeenSinceRegistration[code] = false;
+            _programRealtimeHealthRecoveryAttempted.TryRemove(code, out _);
+        }
+
+        private void MarkProgramRealtimeReceived(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            _programRealtimeSeenSinceRegistration[code] = true;
+        }
+
+        private bool HasRealtimeConsumers(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return false;
+
+            string normalizedCode = code.Trim();
+            return _windowSubscriptions.Values.Any(x =>
+                x != null &&
+                string.Equals(x.Code, normalizedCode, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private bool HasNormalWindowRealtimeConsumer(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return false;
+
+            string normalizedCode = code.Trim();
+            return _windowSubscriptions.Any(x =>
+                x.Value != null &&
+                string.Equals(x.Value.Code, normalizedCode, StringComparison.OrdinalIgnoreCase) &&
+                !x.Key.StartsWith("HOLDING:", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private RealSubscription GetUnifiedRealtimeRepresentative(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return null;
+
+            string normalizedCode = code.Trim();
+
+            var normal = _windowSubscriptions
+                .Where(x =>
+                    x.Value != null &&
+                    string.Equals(x.Value.Code, normalizedCode, StringComparison.OrdinalIgnoreCase) &&
+                    !x.Key.StartsWith("HOLDING:", StringComparison.OrdinalIgnoreCase))
+                .Select(x => x.Value)
+                .FirstOrDefault();
+
+            if (normal != null)
+                return normal;
+
+            return _windowSubscriptions
+                .Where(x =>
+                    x.Value != null &&
+                    string.Equals(x.Value.Code, normalizedCode, StringComparison.OrdinalIgnoreCase))
+                .Select(x => x.Value)
+                .FirstOrDefault();
+        }
+
+        private int EnsureUnifiedSymbolRealtimeRegistration(
+            string windowId,
+            string code,
+            string reason,
+            bool forceReset = false,
+            bool startProgramHealthWatch = true)
+        {
+            string safeWindowId = string.IsNullOrWhiteSpace(windowId) ? "COMMON" : windowId;
+            string normalizedCode = string.IsNullOrWhiteSpace(code) ? string.Empty : code.Trim();
+
+            if (string.IsNullOrWhiteSpace(normalizedCode))
+                return -101;
+
+            if (!HasRealtimeConsumers(normalizedCode))
+            {
+                OnLog?.Invoke(
+                    safeWindowId,
+                    $"[통합 실시간등록 취소] 소비자 없음 / code={normalizedCode} / reason={reason}");
+                return -102;
+            }
+
+            string token = GetOrCreateSymbolToken(normalizedCode);
+            bool hasNormalWindow = HasNormalWindowRealtimeConsumer(normalizedCode);
+            bool shouldStartProgramHealthWatch = startProgramHealthWatch && hasNormalWindow;
+
+            bool alreadyRegistered = false;
+            _unifiedSymbolRealtimeRegistered.TryGetValue(normalizedCode, out alreadyRegistered);
+
+            if (!forceReset && alreadyRegistered)
+            {
+                // 잔고 감시만 먼저 등록된 뒤 일반 창이 붙은 경우에도 실제 FID는 처음부터 전체 58개다.
+                // 따라서 재등록하지 않고 프로그램매매 Health Watch만 활성화한다.
+                if (shouldStartProgramHealthWatch && !_fullRealtimeRegisteredAtByCode.ContainsKey(normalizedCode))
+                    StartProgramRealtimeHealthWatch(normalizedCode);
+
+                Debug.WriteLine(
+                    $"[통합 실시간등록 유지] code={normalizedCode} / screen={token} / reason={reason}");
+                return 0;
+            }
+
+            // 종목별 screen token은 이 종목 전용이므로 최초 실제 등록은 항상 "0" 신규등록으로 시작한다.
+            // 이후 일반 창/잔고 소비자 추가는 실제 SetRealReg를 다시 호출하지 않는다.
+            bool registrationReset = forceReset || !alreadyRegistered;
+
+            int result = RegisterRealtimeWithRecovery(
+                safeWindowId,
+                normalizedCode,
+                token,
+                FullSymbolRealtimeFids,
+                registrationReset,
+                reason,
+                startProgramHealthWatch: shouldStartProgramHealthWatch);
+
+            if (result == 0)
+                _unifiedSymbolRealtimeRegistered[normalizedCode] = true;
+            else
+                _unifiedSymbolRealtimeRegistered.TryRemove(normalizedCode, out _);
+
+            return result;
+        }
+
+        private void ReleaseUnifiedSymbolRealtimeIfUnused(string code, string reason)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            string normalizedCode = code.Trim();
+
+            if (HasRealtimeConsumers(normalizedCode))
+            {
+                if (!HasNormalWindowRealtimeConsumer(normalizedCode))
+                    ClearProgramRealtimeHealthState(normalizedCode);
+
+                return;
+            }
+
+            string token;
+            _symbolScreenTokens.TryGetValue(normalizedCode, out token);
+
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(token) && IsRealtimeApiReady())
+                    _api.SetRealRemove(token, normalizedCode);
+            }
+            catch (System.Runtime.InteropServices.InvalidComObjectException)
+            {
+                MarkKiwoomComShutdown("ReleaseUnifiedRealtimeInvalidComObject");
+            }
+            catch (ObjectDisposedException)
+            {
+                MarkKiwoomComShutdown("ReleaseUnifiedRealtimeObjectDisposed");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(
+                    $"[통합 실시간해제 예외] code={normalizedCode} / screen={token} / reason={reason} / {ex.Message}");
+            }
+
+            _unifiedSymbolRealtimeRegistered.TryRemove(normalizedCode, out _);
+            _inventoryRegistered.TryRemove(normalizedCode, out _);
+            ClearProgramRealtimeHealthState(normalizedCode);
+
+            if (!string.IsNullOrWhiteSpace(token))
+            {
+                string registrationKey = BuildRealtimeRegistrationKey(token, normalizedCode);
+                _realtimeRegistrationRetryPending.TryRemove(registrationKey, out _);
+                _realtimeRegistrationRetryCount.TryRemove(registrationKey, out _);
+                _realtimeRegistrationProgramHealthWatchRequested.TryRemove(registrationKey, out _);
+            }
+
+            ReleaseSymbolToken(normalizedCode);
+
+            OnLog?.Invoke(
+                "COMMON",
+                $"[통합 실시간해제] 마지막 소비자 제거 / code={normalizedCode} / screen={token} / reason={reason}");
+        }
+
+        private int RegisterRealtimeWithRecovery(
+            string windowId,
+            string code,
+            string screenNo,
+            string fids,
+            bool forceReset,
+            string reason,
+            bool startProgramHealthWatch,
+            bool allowDelayedRetry = true)
+        {
+            string safeWindowId = string.IsNullOrWhiteSpace(windowId) ? "COMMON" : windowId;
+            string safeCode = string.IsNullOrWhiteSpace(code) ? string.Empty : code.Trim();
+            string safeScreenNo = string.IsNullOrWhiteSpace(screenNo) ? string.Empty : screenNo.Trim();
+            string safeReason = string.IsNullOrWhiteSpace(reason) ? "RealtimeRegistration" : reason.Trim();
+
+            if (string.IsNullOrWhiteSpace(safeCode) ||
+                string.IsNullOrWhiteSpace(safeScreenNo) ||
+                string.IsNullOrWhiteSpace(fids))
+            {
+                OnLog?.Invoke(
+                    safeWindowId,
+                    $"[실시간등록 실패] 필수값 누락 / code={safeCode} / screen={safeScreenNo} / reason={safeReason}");
+                return -101;
+            }
+
+            if (!IsRealtimeApiReady())
+            {
+                OnLog?.Invoke(
+                    safeWindowId,
+                    $"[실시간등록 보류] API 준비 안됨 / code={safeCode} / screen={safeScreenNo} / reason={safeReason}");
+
+                if (allowDelayedRetry)
+                {
+                    ScheduleRealtimeRegistrationRetry(
+                        safeWindowId,
+                        safeCode,
+                        safeScreenNo,
+                        fids,
+                        safeReason,
+                        startProgramHealthWatch);
+                }
+
+                return -997;
+            }
+
+            int result = -999;
+
+            try
+            {
+                if (forceReset)
+                {
+                    try
+                    {
+                        _api.SetRealRemove(safeScreenNo, safeCode);
+                    }
+                    catch (Exception removeEx)
+                    {
+                        Debug.WriteLine(
+                            $"[실시간등록 복구] 사전 해제 예외 / code={safeCode} / screen={safeScreenNo} / {removeEx.Message}");
+                    }
+
+                    result = _api.SetRealReg(safeScreenNo, safeCode, fids, "0");
+                }
+                else
+                {
+                    result = _api.SetRealReg(safeScreenNo, safeCode, fids, "1");
+
+                    // 추가등록 실패 시 해당 screen/code를 완전히 비우고 전체 FID 신규등록으로 즉시 복구한다.
+                    if (result != 0)
+                    {
+                        OnLog?.Invoke(
+                            safeWindowId,
+                            $"[실시간등록 복구] 추가등록 실패 result={result} / code={safeCode} / screen={safeScreenNo} / reason={safeReason}");
+
+                        try
+                        {
+                            _api.SetRealRemove(safeScreenNo, safeCode);
+                        }
+                        catch (Exception removeEx)
+                        {
+                            Debug.WriteLine(
+                                $"[실시간등록 복구] 실패 후 해제 예외 / code={safeCode} / screen={safeScreenNo} / {removeEx.Message}");
+                        }
+
+                        result = _api.SetRealReg(safeScreenNo, safeCode, fids, "0");
+                    }
+                }
+            }
+            catch (System.Runtime.InteropServices.InvalidComObjectException)
+            {
+                result = -997;
+            }
+            catch (ObjectDisposedException)
+            {
+                result = -997;
+            }
+            catch (System.Runtime.InteropServices.COMException)
+            {
+                result = -997;
+            }
+            catch (Exception ex)
+            {
+                result = -998;
+                Debug.WriteLine(
+                    $"[실시간등록 예외] code={safeCode} / screen={safeScreenNo} / reason={safeReason} / {ex.Message}");
+            }
+
+            string registrationKey = BuildRealtimeRegistrationKey(safeScreenNo, safeCode);
+
+            if (result == 0)
+            {
+                _realtimeRegistrationRetryPending.TryRemove(registrationKey, out _);
+                _realtimeRegistrationRetryCount.TryRemove(registrationKey, out _);
+
+                bool pendingProgramHealthWatch = false;
+                _realtimeRegistrationProgramHealthWatchRequested.TryRemove(
+                    registrationKey,
+                    out pendingProgramHealthWatch);
+
+                _unifiedSymbolRealtimeRegistered[safeCode] = true;
+
+                if (startProgramHealthWatch || pendingProgramHealthWatch)
+                    StartProgramRealtimeHealthWatch(safeCode);
+
+                Debug.WriteLine(
+                    $"[실시간등록 성공] code={safeCode} / screen={safeScreenNo} / reset={(forceReset ? "Y" : "N")} / reason={safeReason}");
+                OnLog?.Invoke(
+                    safeWindowId,
+                    $"[실시간등록 성공] {safeCode} / screen={safeScreenNo} / reset={(forceReset ? "Y" : "N")} / reason={safeReason}");
+                return 0;
+            }
+
+            _unifiedSymbolRealtimeRegistered.TryRemove(safeCode, out _);
+
+            Debug.WriteLine(
+                $"[실시간등록 실패] result={result} / code={safeCode} / screen={safeScreenNo} / reason={safeReason}");
+            OnLog?.Invoke(
+                safeWindowId,
+                $"[실시간등록 실패] result={result} / code={safeCode} / screen={safeScreenNo} / reason={safeReason}");
+
+            if (allowDelayedRetry)
+            {
+                ScheduleRealtimeRegistrationRetry(
+                    safeWindowId,
+                    safeCode,
+                    safeScreenNo,
+                    fids,
+                    safeReason,
+                    startProgramHealthWatch);
+            }
+
+            return result;
+        }
+
+        private void ScheduleRealtimeRegistrationRetry(
+            string windowId,
+            string code,
+            string screenNo,
+            string fids,
+            string reason,
+            bool startProgramHealthWatch)
+        {
+            string key = BuildRealtimeRegistrationKey(screenNo, code);
+
+            if (startProgramHealthWatch)
+                _realtimeRegistrationProgramHealthWatchRequested[key] = true;
+
+            if (!_realtimeRegistrationRetryPending.TryAdd(key, true))
+                return;
+
+            int attempt = _realtimeRegistrationRetryCount.AddOrUpdate(
+                key,
+                1,
+                (_, current) => current + 1);
+
+            if (attempt > RealtimeRegistrationMaxDelayedRetries)
+            {
+                _realtimeRegistrationRetryPending.TryRemove(key, out _);
+                _realtimeRegistrationRetryCount.TryRemove(key, out _);
+                _realtimeRegistrationProgramHealthWatchRequested.TryRemove(key, out _);
+                OnLog?.Invoke(
+                    string.IsNullOrWhiteSpace(windowId) ? "COMMON" : windowId,
+                    $"[실시간등록 재시도 종료] code={code} / screen={screenNo} / attempts={attempt - 1} / reason={reason}");
+                return;
+            }
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(
+                        RealtimeRegistrationRetryDelayMilliseconds * attempt)
+                        .ConfigureAwait(false);
+
+                    if (!HasRealtimeConsumers(code))
+                    {
+                        _realtimeRegistrationRetryPending.TryRemove(key, out _);
+                        _realtimeRegistrationRetryCount.TryRemove(key, out _);
+                        _realtimeRegistrationProgramHealthWatchRequested.TryRemove(key, out _);
+                        return;
+                    }
+
+                    bool alreadyRegistered;
+                    if (_unifiedSymbolRealtimeRegistered.TryGetValue(code, out alreadyRegistered) &&
+                        alreadyRegistered)
+                    {
+                        bool pendingProgramHealthWatch = false;
+                        _realtimeRegistrationProgramHealthWatchRequested.TryRemove(
+                            key,
+                            out pendingProgramHealthWatch);
+
+                        if ((startProgramHealthWatch || pendingProgramHealthWatch) &&
+                            HasNormalWindowRealtimeConsumer(code) &&
+                            !_fullRealtimeRegisteredAtByCode.ContainsKey(code))
+                        {
+                            StartProgramRealtimeHealthWatch(code);
+                        }
+
+                        _realtimeRegistrationRetryPending.TryRemove(key, out _);
+                        _realtimeRegistrationRetryCount.TryRemove(key, out _);
+                        return;
+                    }
+
+                    var dispatcher = System.Windows.Application.Current == null
+                        ? null
+                        : System.Windows.Application.Current.Dispatcher;
+
+                    if (dispatcher == null)
+                    {
+                        _realtimeRegistrationRetryPending.TryRemove(key, out _);
+                        _realtimeRegistrationRetryCount.TryRemove(key, out _);
+                        _realtimeRegistrationProgramHealthWatchRequested.TryRemove(key, out _);
+                        return;
+                    }
+
+                    await dispatcher.InvokeAsync(() =>
+                    {
+                        _realtimeRegistrationRetryPending.TryRemove(key, out _);
+
+                        bool pendingProgramHealthWatch = false;
+                        _realtimeRegistrationProgramHealthWatchRequested.TryGetValue(
+                            key,
+                            out pendingProgramHealthWatch);
+
+                        int retryResult = RegisterRealtimeWithRecovery(
+                            windowId,
+                            code,
+                            screenNo,
+                            fids,
+                            forceReset: true,
+                            reason: string.Format(
+                                CultureInfo.InvariantCulture,
+                                "{0}/DelayedRetry{1}",
+                                reason,
+                                attempt),
+                            startProgramHealthWatch: startProgramHealthWatch || pendingProgramHealthWatch,
+                            allowDelayedRetry: false);
+
+                        if (retryResult != 0)
+                        {
+                            ScheduleRealtimeRegistrationRetry(
+                                windowId,
+                                code,
+                                screenNo,
+                                fids,
+                                reason,
+                                startProgramHealthWatch);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _realtimeRegistrationRetryPending.TryRemove(key, out _);
+                    _realtimeRegistrationRetryCount.TryRemove(key, out _);
+                    _realtimeRegistrationProgramHealthWatchRequested.TryRemove(key, out _);
+                    OnLog?.Invoke(
+                        string.IsNullOrWhiteSpace(windowId) ? "COMMON" : windowId,
+                        $"[실시간등록 재시도 예외] code={code} / screen={screenNo} / attempt={attempt} / {ex.Message}");
+                }
+            });
+        }
+
+        private void TryRecoverProgramRealtimeRegistration(string code, DateTime stockTradeTime)
+        {
+            if (string.IsNullOrWhiteSpace(code) ||
+                !IsRegularStockRealtimeTickTime(stockTradeTime))
+                return;
+
+            DateTime registeredAt;
+            if (!_fullRealtimeRegisteredAtByCode.TryGetValue(code, out registeredAt))
+                return;
+
+            if ((stockTradeTime - registeredAt).TotalSeconds < ProgramRealtimeInitialHealthCheckSeconds)
+                return;
+
+            bool programRealtimeSeen;
+            if (_programRealtimeSeenSinceRegistration.TryGetValue(code, out programRealtimeSeen) &&
+                programRealtimeSeen)
+                return;
+
+            if (!_programRealtimeHealthRecoveryAttempted.TryAdd(code, true))
+                return;
+
+            var target = GetUnifiedRealtimeRepresentative(code);
+
+            if (target == null || string.IsNullOrWhiteSpace(target.ScreenNo))
+            {
+                _programRealtimeHealthRecoveryAttempted.TryRemove(code, out _);
+                return;
+            }
+
+            OnLog?.Invoke(
+                target.WindowId ?? "COMMON",
+                $"[프로그램매매 실시간 복구] 주식체결 정상 + 등록 후 {ProgramRealtimeInitialHealthCheckSeconds}초 동안 Program RealType 미수신 / code={code} / screen={target.ScreenNo}");
+
+            // OnReceiveRealData 콜백 안에서 SetRealRemove/SetRealReg를 직접 호출하지 않는다.
+            // 현재 이벤트 처리가 끝난 뒤 UI Dispatcher에서 복구 등록을 실행해 COM 재진입을 피한다.
+            var dispatcher = System.Windows.Application.Current == null
+                ? null
+                : System.Windows.Application.Current.Dispatcher;
+
+            if (dispatcher == null)
+            {
+                _programRealtimeHealthRecoveryAttempted.TryRemove(code, out _);
+                return;
+            }
+
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                EnsureUnifiedSymbolRealtimeRegistration(
+                    target.WindowId ?? "COMMON",
+                    code,
+                    reason: "ProgramRealTypeInitialHealthCheck",
+                    forceReset: true,
+                    startProgramHealthWatch: false);
+            }), DispatcherPriority.Background);
+        }
+
         public void ReplaceSubscription(string windowId, string screenNo, string newCode)
         {
             if (string.IsNullOrWhiteSpace(windowId) ||
                 string.IsNullOrWhiteSpace(newCode))
                 return;
 
-            string token = GetOrCreateSymbolToken(newCode);
+            string normalizedCode = newCode.Trim();
 
             System.Windows.Application.Current?.Dispatcher.Invoke(() =>
             {
-                if (_api == null || _api.IsDisposed || !_api.IsHandleCreated)
-                    return;
+                RealSubscription existing;
+                bool hasExisting = _windowSubscriptions.TryGetValue(windowId, out existing);
+                bool sameCode = hasExisting &&
+                    existing != null &&
+                    string.Equals(existing.Code, normalizedCode, StringComparison.OrdinalIgnoreCase);
 
-                if (_windowSubscriptions.TryGetValue(windowId, out var existing))
+                string oldCode = hasExisting && existing != null
+                    ? existing.Code
+                    : string.Empty;
+
+                if (hasExisting && !sameCode)
                 {
-                    if (existing.Code == newCode)
-                        return;
-
-                    _api.SetRealRemove(existing.ScreenNo, existing.Code);
-                    Debug.WriteLine($"🔻 실시간 해제: {existing.Code} (창ID: {windowId}, token:{existing.ScreenNo})");
+                    // 실제 키움 해제는 여기서 하지 않는다.
+                    // 먼저 이 창 소비자만 제거하고, 해당 종목의 마지막 소비자인지 통합 등록부가 판단한다.
+                    _windowSubscriptions.TryRemove(windowId, out _);
+                    ReleaseUnifiedSymbolRealtimeIfUnused(oldCode, "ReplaceSubscription/OldCodeDetached");
                 }
 
-                // 체결 + 호가 FID 같이 등록
-                string fids =
-                    "10;11;12;13;15;20;228;" +
-                    "41;42;43;44;45;46;47;48;49;50;" +
-                    "51;52;53;54;55;56;57;58;59;60;" +
-                    "61;62;63;64;65;66;67;68;69;70;" +
-                    "71;72;73;74;75;76;77;78;79;80;" +
-                    "121;125";
-
-                _api.SetRealReg(token, newCode, fids, "1");
+                string token = GetOrCreateSymbolToken(normalizedCode);
 
                 _windowSubscriptions[windowId] = new RealSubscription
                 {
                     WindowId = windowId,
-                    Code = newCode,
+                    Code = normalizedCode,
                     ScreenNo = token
                 };
 
-                Debug.WriteLine($"📡 실시간/호가 등록: {newCode} (창ID: {windowId}, token:{token})");
+                int result = EnsureUnifiedSymbolRealtimeRegistration(
+                    windowId,
+                    normalizedCode,
+                    sameCode ? "ReplaceSubscription/SameCodeConsumerRefresh" : "ReplaceSubscription/NewConsumer",
+                    forceReset: false);
+
+                Debug.WriteLine(
+                    $"[통합 실시간 소비자] 일반창 등록 / code={normalizedCode} / window={windowId} / screen={token} / sameCode={(sameCode ? "Y" : "N")} / result={result}");
             });
         }
         private readonly ConcurrentDictionary<string, HashSet<(string ScreenNo, string WindowId)>> _realTimeMap = new ConcurrentDictionary<string, HashSet<(string ScreenNo, string WindowId)>>();
@@ -404,34 +1053,331 @@ namespace MoneyCreator.Service
             if (string.IsNullOrWhiteSpace(code))
                 return;
 
-            string token = GetOrCreateSymbolToken(code);
+            string normalizedCode = code.Trim();
+            string token = GetOrCreateSymbolToken(normalizedCode);
+            bool firstConsumer = _inventoryRegistered.TryAdd(normalizedCode, true);
+            string inventoryKey = $"HOLDING:{normalizedCode}";
 
-            // 종목별 1회만 실시간 등록
-            if (!_inventoryRegistered.TryAdd(code, true))
-            {
-                OnLog?.Invoke(windowId, $"[잔고감시] {code} 이미 등록됨 token={token}");
-                return;
-            }
-
-            string inventoryKey = $"HOLDING:{code}";
-
+            // 잔고 감시도 소비자 정보만 추가한다.
+            // 실제 SetRealReg는 EnsureUnifiedSymbolRealtimeRegistration 한 곳에서 전체 FID 58개로만 실행된다.
             _windowSubscriptions[inventoryKey] = new RealSubscription
             {
                 WindowId = "COMMON",
-                Code = code,
+                Code = normalizedCode,
                 ScreenNo = token
             };
 
             System.Windows.Application.Current?.Dispatcher.Invoke(() =>
             {
-                if (_api == null || _api.IsDisposed || !_api.IsHandleCreated)
-                    return;
+                int result = EnsureUnifiedSymbolRealtimeRegistration(
+                    windowId,
+                    normalizedCode,
+                    firstConsumer
+                        ? "InventoryTracking/NewConsumer"
+                        : "InventoryTracking/ConsumerRefresh",
+                    forceReset: false);
 
-                string inventoryFids = "10;12;11;13;15;20;121;125;228";
-                _api.SetRealReg(token, code, inventoryFids, "1");
-
-                OnLog?.Invoke(windowId, $"[잔고감시] {code} 전역 실시간 등록 완료 token={token}");
+                OnLog?.Invoke(
+                    windowId,
+                    $"[잔고감시] {normalizedCode} 통합 실시간 소비자 {(firstConsumer ? "등록" : "갱신")} / token={token} / actualSetRealReg={(result == 0 ? "정상" : "실패")} / result={result}");
             });
+        }
+
+
+        private void Api_OnReceiveMsg(object sender, _DKHOpenAPIEvents_OnReceiveMsgEvent e)
+        {
+            string msg = e == null ? string.Empty : (e.sMsg ?? string.Empty);
+            ApplyMarketSafetyMessage(msg);
+        }
+
+        private void ApplyMarketSafetyMessage(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return;
+
+            string msg = message.Trim();
+            string compact = msg.Replace(" ", string.Empty);
+            DateTime now = DateTime.Now;
+
+            if (msg.Contains("서킷브레이커") ||
+                compact.Contains("CB1") ||
+                compact.Contains("CB2") ||
+                compact.Contains("CB3") ||
+                msg.Contains("CB 1") ||
+                msg.Contains("CB 2") ||
+                msg.Contains("CB 3") ||
+                msg.Contains("매매거래 중단") ||
+                msg.Contains("거래가 중단") ||
+                msg.Contains("거래 중단"))
+            {
+                SetMarketSafetyState(
+                    MarketSafetyState.CircuitBreaker,
+                    "KIWOOM_MSG",
+                    msg,
+                    now.AddMinutes(MarketSafetyCircuitBreakerBlockMinutes));
+                return;
+            }
+
+            if ((msg.Contains("거래") || msg.Contains("매매")) && msg.Contains("재개"))
+            {
+                SetMarketSafetyState(
+                    MarketSafetyState.RecoveryCooldown,
+                    "KIWOOM_MSG_RESUME",
+                    msg,
+                    now.AddMinutes(MarketSafetyRecoveryCooldownMinutes));
+            }
+        }
+
+        private static bool IsBuyOrderTypeForMarketSafety(int orderType)
+        {
+            return orderType == 1 || orderType == 5;
+        }
+
+        public bool IsBuyBlockedByMarketSafety(out string reason)
+        {
+            reason = null;
+            EvaluateMarketSafetyForOrderGate();
+
+            if (CurrentMarketSafetyState == MarketSafetyState.Normal)
+                return false;
+
+            reason = BuildMarketSafetyBlockReason();
+            return true;
+        }
+
+        private string BuildMarketSafetyBlockReason()
+        {
+            string state = CurrentMarketSafetyState.ToString();
+            string reason = string.IsNullOrWhiteSpace(CurrentMarketSafetyReason)
+                ? state
+                : CurrentMarketSafetyReason;
+
+            if (_marketSafetyBlockBuyUntil > DateTime.Now)
+                return $"시장안전차단({state}) / {_marketSafetyBlockBuyUntil:HH:mm:ss}까지 신규매수 차단 / {reason}";
+
+            return $"시장안전차단({state}) / {reason}";
+        }
+
+        private void EvaluateMarketSafetyForOrderGate()
+        {
+            DateTime now = DateTime.Now;
+            ResetMarketSafetyAtRegularOpenIfNeeded(now);
+            RefreshMarketSafetyStateByTime(now);
+
+            if (CurrentMarketSafetyState != MarketSafetyState.Normal)
+                return;
+
+            if (!IsMarketOpenForSafety(now))
+                return;
+
+            if (!IsIndexCrashForCircuitBreakerSuspicion())
+                return;
+
+            if (!IsStockTickStarved(now))
+                return;
+
+            SetMarketSafetyState(
+                MarketSafetyState.HaltSuspected,
+                "TICK_STARVATION",
+                $"장중 다종목 틱 공백 {MarketSafetyTickStopSeconds}초 이상 + 지수 급락(KOSPI={_latestKospiChangeRate:F2}%, KOSDAQ={_latestKosdaqChangeRate:F2}%)",
+                now.AddMinutes(MarketSafetyRecoveryCooldownMinutes));
+        }
+
+        private void ResetMarketSafetyAtRegularOpenIfNeeded(DateTime now)
+        {
+            if (now.TimeOfDay < RegularStockRealtimeStartTime)
+                return;
+
+            if (_lastMarketSafetyRegularOpenResetDate == now.Date)
+                return;
+
+            _lastMarketSafetyRegularOpenResetDate = now.Date;
+
+            _lastStockTickReceivedAt.Clear();
+            _lastAnyStockTickReceivedAt = DateTime.MinValue;
+            _marketSafetyBlockBuyUntil = DateTime.MinValue;
+
+            SetMarketSafetyState(
+                MarketSafetyState.Normal,
+                "REGULAR_OPEN_RESET",
+                "09:00 정규장 시작 - 장전 예상체결/단일가 상태 초기화",
+                DateTime.MinValue);
+        }
+
+        private void RefreshMarketSafetyStateByTime(DateTime now)
+        {
+            if (CurrentMarketSafetyState == MarketSafetyState.Normal)
+                return;
+
+            if (_marketSafetyBlockBuyUntil != DateTime.MinValue && now < _marketSafetyBlockBuyUntil)
+                return;
+
+            SetMarketSafetyState(
+                MarketSafetyState.Normal,
+                "TIMEOUT",
+                "시장안전 차단 시간 경과",
+                DateTime.MinValue);
+        }
+
+        private static bool IsMarketOpenForSafety(DateTime now)
+        {
+            TimeSpan tod = now.TimeOfDay;
+            return tod >= new TimeSpan(9, 0, 0) && tod <= new TimeSpan(15, 30, 0);
+        }
+
+        private bool IsIndexCrashForCircuitBreakerSuspicion()
+        {
+            return _latestKospiChangeRate <= -7.5 || _latestKosdaqChangeRate <= -7.5;
+        }
+
+        private bool IsStockTickStarved(DateTime now)
+        {
+            var monitoredCodes = _windowSubscriptions.Values
+                .Where(x => x != null && IsNormalStockCode(x.Code))
+                .Select(x => x.Code)
+                .Distinct()
+                .ToList();
+
+            if (monitoredCodes.Count < 3)
+                return false;
+
+            int silentCount = 0;
+
+            foreach (var code in monitoredCodes)
+            {
+                DateTime last;
+                if (!_lastStockTickReceivedAt.TryGetValue(code, out last) ||
+                    (now - last).TotalSeconds >= MarketSafetyTickStopSeconds)
+                {
+                    silentCount++;
+                }
+            }
+
+            return silentCount >= 3 &&
+                   (_lastAnyStockTickReceivedAt == DateTime.MinValue ||
+                    (now - _lastAnyStockTickReceivedAt).TotalSeconds >= MarketSafetyTickStopSeconds);
+        }
+
+        private bool IsNormalStockCode(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return false;
+
+            code = code.Trim();
+            return code.Length == 6 && !IsMarketIndexCode(code);
+        }
+
+        private void ObserveMarketIndexForSafety(MarketIndexInfo index)
+        {
+            if (index == null)
+                return;
+
+            if (index.Code == "001")
+                _latestKospiChangeRate = index.ChangeRate;
+            else if (index.Code == "101")
+                _latestKosdaqChangeRate = index.ChangeRate;
+
+            DateTime now = DateTime.Now;
+            ResetMarketSafetyAtRegularOpenIfNeeded(now);
+
+            // 장전 지수/예상체결 데이터가 서킷브레이커 방어엔진을 오염시키면
+            // 09:00 이후 정상 Buy 신호가 RecoveryCooldown에 막힐 수 있다.
+            if (!IsMarketOpenForSafety(now))
+                return;
+
+            EvaluateMarketSafetyForOrderGate();
+        }
+
+        private void ObserveStockTickForSafety(string code, DateTime tradeTime)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            if (!IsRegularStockRealtimeTickTime(tradeTime))
+                return;
+
+            ResetMarketSafetyAtRegularOpenIfNeeded(tradeTime);
+
+            DateTime now = tradeTime;
+            _lastAnyStockTickReceivedAt = now;
+            _lastStockTickReceivedAt[code.Trim()] = now;
+
+            if (CurrentMarketSafetyState == MarketSafetyState.CircuitBreaker ||
+                CurrentMarketSafetyState == MarketSafetyState.HaltSuspected)
+            {
+                SetMarketSafetyState(
+                    MarketSafetyState.RecoveryCooldown,
+                    "TICK_RESUME",
+                    $"시장중단 이후 정규장 체결 재개 감지: {code}",
+                    now.AddMinutes(MarketSafetyRecoveryCooldownMinutes));
+                return;
+            }
+
+            if (CurrentMarketSafetyState == MarketSafetyState.RecoveryCooldown)
+                RefreshMarketSafetyStateByTime(now);
+        }
+
+        private void ObserveExpectedAuctionForSafety(string code)
+        {
+            DateTime now = DateTime.Now;
+            ResetMarketSafetyAtRegularOpenIfNeeded(now);
+            RefreshMarketSafetyStateByTime(now);
+
+            // 예상체결은 장전/단일가성 데이터라서 신규매수 차단용 buyBlockUntil을 만들면 안 된다.
+            // 실제 CircuitBreaker/Halt 판단은 키움 메시지 또는 09:00 이후 정규장 실체결 tick으로만 한다.
+            if (!IsMarketOpenForSafety(now))
+            {
+                LogExpectedAuction(code, "장중 아님 - 시장안전 상태 전환 없음");
+                return;
+            }
+
+            LogExpectedAuction(code, "예상체결 수신 - 시장안전 상태 전환 없음");
+        }
+
+        private void LogExpectedAuction(string code, string detail)
+        {
+            DateTime now = DateTime.Now;
+
+            if ((now - _lastExpectedAuctionLogAt).TotalSeconds < 30)
+                return;
+
+            _lastExpectedAuctionLogAt = now;
+
+            OnLog?.Invoke(
+                "COMMON",
+                $"[예상체결] {code} / {detail}");
+        }
+
+        private void SetMarketSafetyState(
+            MarketSafetyState state,
+            string source,
+            string reason,
+            DateTime blockBuyUntil)
+        {
+            bool shouldLog;
+            string logMessage;
+
+            lock (_marketSafetyLock)
+            {
+                bool changed = CurrentMarketSafetyState != state ||
+                               !string.Equals(CurrentMarketSafetyReason, reason, StringComparison.Ordinal);
+
+                CurrentMarketSafetyState = state;
+                CurrentMarketSafetyReason = reason ?? string.Empty;
+                _marketSafetyBlockBuyUntil = blockBuyUntil;
+                _marketSafetyUpdatedAt = DateTime.Now;
+
+                shouldLog = changed || (DateTime.Now - _lastMarketSafetyLogAt).TotalSeconds >= 30;
+                if (shouldLog)
+                    _lastMarketSafetyLogAt = DateTime.Now;
+
+                logMessage = state == MarketSafetyState.Normal
+                    ? $"[시장안전] Normal 복귀 / source={source} / {CurrentMarketSafetyReason}"
+                    : $"[시장안전] {state} / source={source} / buyBlockUntil={(_marketSafetyBlockBuyUntil == DateTime.MinValue ? "-" : _marketSafetyBlockBuyUntil.ToString("HH:mm:ss"))} / {CurrentMarketSafetyReason}";
+            }
+
+            if (shouldLog)
+                OnLog?.Invoke("COMMON", logMessage);
         }
 
         public int SendOrder(string windowId, string screenNo, string accountNo, int orderType, string code, int qty, int price, string hogaType, string orgOrderNo = "")
@@ -458,6 +1404,16 @@ namespace MoneyCreator.Service
             {
                 OnLog?.Invoke(windowId, $"⛔ 주문 전송 차단: 지정가 가격 오류 / {code} / price={price}");
                 return -103;
+            }
+
+            if (IsBuyOrderTypeForMarketSafety(orderType))
+            {
+                string marketSafetyReason;
+                if (IsBuyBlockedByMarketSafety(out marketSafetyReason))
+                {
+                    OnLog?.Invoke(windowId, $"⛔ 주문 전송 차단: 시장안전 / {code} / {marketSafetyReason}");
+                    return -180;
+                }
             }
 
             int result = _api.SendOrder(
@@ -508,6 +1464,20 @@ namespace MoneyCreator.Service
                 .AddSeconds(parsedTime.Second);
         }
 
+        private static bool IsRegularStockRealtimeTickTime(DateTime tradeTime)
+        {
+            if (tradeTime == default(DateTime))
+                return false;
+
+            TimeSpan tod = tradeTime.TimeOfDay;
+            return tod >= RegularStockRealtimeStartTime && tod < RegularStockRealtimeEndTime;
+        }
+
+        private static bool IsBeforeRegularStockRealtimeOpen(DateTime now)
+        {
+            return now.TimeOfDay < RegularStockRealtimeStartTime;
+        }
+
         private void Api_OnReceiveRealData(object sender, _DKHOpenAPIEvents_OnReceiveRealDataEvent e)
         {
             if (DateTime.Now.TimeOfDay >= new TimeSpan(15, 20, 0))
@@ -534,7 +1504,15 @@ namespace MoneyCreator.Service
                     UpdatedAt = DateTime.Now
                 };
 
+                ObserveMarketIndexForSafety(index);
                 OnMarketIndexReceived?.Invoke(index);
+                return;
+            }
+
+            if (e.sRealType == "종목프로그램매매")
+            {
+                MarkProgramRealtimeReceived(code);
+                ParseAndSendProgramTrade(windowId: "COMMON", code: code, source: "REALTIME");
                 return;
             }
 
@@ -551,6 +1529,11 @@ namespace MoneyCreator.Service
                     return;
 
                 DateTime tradeTime = ParseRealTradeTime(rawTradeTime);
+
+                // 08:30 예상체결/단일가성 1틱이 실시간 틱/자동매매/시장안전 상태를 오염시키면 안 된다.
+                // 정규장 실시간 체결 tick은 09:00:00부터만 하위 데이터 파이프라인으로 전달한다.
+                if (!IsRegularStockRealtimeTickTime(tradeTime))
+                    return;
 
                 double strength = double.TryParse(rawStrength, out double st) ? st : 0;
                 long accVol = long.TryParse(rawAccVol, out long av) ? av : 0;
@@ -582,6 +1565,9 @@ namespace MoneyCreator.Service
                     LowPrice = priceStr
                 };
 
+                ObserveStockTickForSafety(code, tradeTime);
+                TryRecoverProgramRealtimeRegistration(code, tradeTime);
+
                 _tickQueue.Enqueue(new TickData
                 {
                     Code = code,
@@ -610,7 +1596,7 @@ namespace MoneyCreator.Service
                             sub.WindowId,
                             priceStr,
                             Math.Abs(volume),
-                            DateTime.Now
+                            tradeTime
                         );
 
                         OnInventoryTickReceived?.Invoke(currentTick);
@@ -627,6 +1613,8 @@ namespace MoneyCreator.Service
                     ? tracked.LastPrice
                     : 0;
 
+                bool savedHogaToDb = false;
+
                 foreach (var pair in _windowSubscriptions)
                 {
                     var sub = pair.Value;
@@ -634,12 +1622,19 @@ namespace MoneyCreator.Service
                     if (sub.Code != code || sub.ScreenNo == "9999")
                         continue;
 
-                    ParseAndSendHoga(sub.WindowId, code, lastPrice);
+                    ParseAndSendHoga(sub.WindowId, code, lastPrice, !savedHogaToDb);
+                    savedHogaToDb = true;
                 }
             }
             if (e.sRealType == "주식예상체결")
             {
-                OnLog?.Invoke("COMMON", $"[예상체결] {code} / 단일가 또는 거래중단 구간 예상체결 수신");
+                if (IsBeforeRegularStockRealtimeOpen(DateTime.Now))
+                {
+                    LogExpectedAuction(code, "09:00 전 예상체결 무시 - 시장안전/실시간틱 반영 없음");
+                    return;
+                }
+
+                ObserveExpectedAuctionForSafety(code);
                 return;
             }
         }
@@ -798,6 +1793,12 @@ namespace MoneyCreator.Service
 
 
         private static readonly SemaphoreSlim _apiSemaphore = new SemaphoreSlim(1, 1);
+        private const int TrContinuousRequestDelayMilliseconds = 300;
+
+        private static Task DelayBeforeContinuousTrRequestAsync()
+        {
+            return Task.Delay(TrContinuousRequestDelayMilliseconds);
+        }
 
 
         // ============================================================
@@ -885,30 +1886,130 @@ namespace MoneyCreator.Service
             });
         }
 
-        // [추가] 최근 틱 윈도우 계산
-        // - 09:00~09:10 사이면 전일 15:11~15:20
-        // - 그 외 장중이면 현재시간 - N분 ~ 현재시간
+
+        public void RequestProgramTradeHistory(string windowId, string code, string screenNo, int minutes = ProgramTradeDefaultSeedMinutes, int priority = 1, int next = 0)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            // 15:20 이후에도 TR 히스토리는 요청한다.
+            // 노이즈 컷은 요청 차단이 아니라 ProcessProgramTradeHistoryData에서 시간 필터로 처리한다.
+            string token = GetOrCreateSymbolToken(code);
+            int safeMinutes = Math.Max(1, minutes);
+
+            if (next == 0)
+            {
+                string cycleKey = $"{windowId}_{code}_PROGRAM";
+                _programTradeRequestCycleMap.TryRemove(cycleKey, out _);
+            }
+
+            _scheduler.Enqueue(new TrRequest
+            {
+                WindowId = windowId,
+                Code = code,
+                Next = next,
+                ScreenNo = token,
+                Priority = priority,
+                RequestType = "PROGRAM_TRADE",
+                Inputs = new Dictionary<string, string>
+                {
+                    { "시간일자구분", "1" },
+                    { "금액수량구분", "1" },
+                    { "종목코드", code },
+                    { "날짜", DateTime.Now.ToString("yyyyMMdd") },
+                    { "__MINUTES__", safeMinutes.ToString() }
+                }
+            });
+
+            OnLog?.Invoke(windowId, $"[프로그램매매] 히스토리 요청 등록: {code} / minutes={safeMinutes} / next={next} / token={token}");
+        }
+
+        private static readonly TimeSpan AnalysisMinuteStartTime = new TimeSpan(9, 0, 0);
+        private static readonly TimeSpan AnalysisMinuteEndTime = new TimeSpan(15, 20, 59);
+        private static readonly TimeSpan AnalysisCloseTickStartTime = new TimeSpan(15, 15, 0);
+        private static readonly TimeSpan AnalysisCloseTickEndTime = new TimeSpan(15, 20, 59);
+        private static readonly TimeSpan ProgramTradeStartTime = new TimeSpan(9, 0, 0);
+        private static readonly TimeSpan ProgramTradeEndTime = new TimeSpan(15, 20, 0);
+        private const int ProgramTradeDefaultSeedMinutes = 30;
+        private const int ProgramTradeUiWarmupMinutes = 10;
+
+        // KOA Studio RealType: 종목프로그램매매 기준 FID.
+        // 값이 0으로만 들어오면 KOA Studio의 실시간 탭에서 FID를 먼저 확인해야 한다.
+        private const int FidProgramTime = 20;
+        private const int FidProgramCurrentPrice = 10;
+        private const int FidProgramVolume = 13;
+        private const int FidProgramSellAmount = 202;
+        private const int FidProgramBuyAmount = 204;
+        private const int FidProgramNetAmount = 206;
+        private const int FidProgramNetAmountDelta = 208;
+        private const int FidProgramSellQuantity = 210;
+        private const int FidProgramBuyQuantity = 211;
+        private const int FidProgramNetQuantity = 212;
+        private const int FidProgramNetQuantityDelta = 213;
+
+        private static bool IsAnalysisMinuteTime(DateTime time)
+        {
+            if (time == DateTime.MinValue)
+                return false;
+
+            TimeSpan tod = time.TimeOfDay;
+            return tod >= AnalysisMinuteStartTime && tod <= AnalysisMinuteEndTime;
+        }
+
+        private DateTime ResolveAnalysisCloseTickDate(DateTime now)
+        {
+            DateTime date = now == DateTime.MinValue ? DateTime.Today : now.Date;
+
+            // 장중 또는 15:20:59 이전에는 아직 당일 종가 구간이 완성되지 않았으므로
+            // 분석용 과거틱 seed는 직전 거래일 15:15~15:20 구간을 사용한다.
+            if (now.TimeOfDay <= AnalysisCloseTickEndTime)
+                return GetPreviousTradingDay(date);
+
+            return date;
+        }
+
+        // 분석용 최근틱 seed는 현재시각 기준이 아니라 15:20 종가 구간 -5분으로 통일한다.
+        // Replay 원천 수집용 음수 날짜 요청은 하루 재생을 위해 09:00~15:20:59 전체를 유지한다.
         private TickWindowRange GetRecentTickWindow(DateTime now, int minutes)
         {
-            DateTime marketOpen = new DateTime(now.Year, now.Month, now.Day, 9, 0, 0);
-            DateTime openingLimit = marketOpen.AddMinutes(minutes);
+            if (TryResolveReplayTickDateRequest(minutes, out var replayTradingDate))
+                return GetReplayFullDayTickWindow(replayTradingDate);
 
-            if (now >= marketOpen && now < openingLimit)
-            {
-                DateTime prev = GetPreviousTradingDay(now.Date);
-                return new TickWindowRange
-                {
-                    Start = new DateTime(prev.Year, prev.Month, prev.Day, 15, 11, 0),
-                    End = new DateTime(prev.Year, prev.Month, prev.Day, 15, 20, 59),
-                    IsPreviousCloseWindow = true
-                };
-            }
+            DateTime seedDate = ResolveAnalysisCloseTickDate(now);
 
             return new TickWindowRange
             {
-                Start = now.AddMinutes(-minutes),
-                End = now,
-                IsPreviousCloseWindow = false
+                Start = seedDate.Date.Add(AnalysisCloseTickStartTime),
+                End = seedDate.Date.Add(AnalysisCloseTickEndTime),
+                IsPreviousCloseWindow = seedDate.Date != now.Date,
+                UseRangeDate = false
+            };
+        }
+
+        private static bool TryResolveReplayTickDateRequest(int minutes, out DateTime tradingDate)
+        {
+            tradingDate = DateTime.MinValue;
+
+            if (minutes >= 0)
+                return false;
+
+            int rawDate = Math.Abs(minutes);
+            if (!DateTime.TryParseExact(rawDate.ToString(), "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out tradingDate))
+                return false;
+
+            return true;
+        }
+
+        private static TickWindowRange GetReplayFullDayTickWindow(DateTime tradingDate)
+        {
+            DateTime date = tradingDate == DateTime.MinValue ? DateTime.Today : tradingDate.Date;
+
+            return new TickWindowRange
+            {
+                Start = date.Add(AnalysisMinuteStartTime),
+                End = date.Add(AnalysisMinuteEndTime),
+                IsPreviousCloseWindow = false,
+                UseRangeDate = true
             };
         }
 
@@ -927,6 +2028,7 @@ namespace MoneyCreator.Service
             public DateTime Start { get; set; }
             public DateTime End { get; set; }
             public bool IsPreviousCloseWindow { get; set; }
+            public bool UseRangeDate { get; set; }
         }
 
 
@@ -979,6 +2081,10 @@ namespace MoneyCreator.Service
                         date = range.Start.Date;
                     else
                         date = now.Date;
+                }
+                else if (range.UseRangeDate)
+                {
+                    date = range.Start.Date;
                 }
                 else
                 {
@@ -1121,6 +2227,17 @@ namespace MoneyCreator.Service
                                     trCode = "opt10079";
                                     break;
                                 }
+
+                            case "PROGRAM_TRADE":
+                                {
+                                    string minutes = req.Inputs != null && req.Inputs.ContainsKey("__MINUTES__")
+                                        ? req.Inputs["__MINUTES__"]
+                                        : ProgramTradeDefaultSeedMinutes.ToString();
+
+                                    rqName = $"프로그램매매_{req.Code}_{req.WindowId}_{req.ScreenNo}_{minutes}_{req.Token}";
+                                    trCode = "OPT90008";
+                                    break;
+                                }
                         }
 
                         requestTrCode = trCode;
@@ -1185,6 +2302,14 @@ namespace MoneyCreator.Service
                             new List<TrackedSymbol>(),
                             true);
                     }
+                    else if (requestType == "PROGRAM_TRADE")
+                    {
+                        // 프로그램매매 실패/상태 행은 실제 데이터가 아니므로 UI/DB로 보내지 않는다.
+                        // 히스토리/분석 버퍼는 09:00~15:20 실제 수신 데이터만 유지한다.
+                        OnLog?.Invoke(
+                            req.WindowId ?? "SYSTEM",
+                            $"[프로그램매매] 히스토리 요청 실패 - UI 데이터 미추가: {req.Code} / result={requestResult}");
+                    }
 
                     return;
                 }
@@ -1238,7 +2363,7 @@ namespace MoneyCreator.Service
             return _latestHoga.TryGetValue(code, out snapshot);
         }
 
-        private void ParseAndSendHoga(string windowId, string code, double currentPrice)
+        private void ParseAndSendHoga(string windowId, string code, double currentPrice, bool saveToDb = true)
         {
             try
             {
@@ -1280,6 +2405,9 @@ namespace MoneyCreator.Service
                     TotalBidQty = hoga.TotalBidQty,
                     Time = DateTime.Now
                 };
+
+                if (saveToDb)
+                    _dbManager?.EnqueueHoga(hoga);
 
                 OnHogaReceived?.Invoke(windowId, hoga);
             }
@@ -1337,6 +2465,11 @@ namespace MoneyCreator.Service
             {
                 int minutes = parts.Length > 4 && int.TryParse(parts[4], out var m) ? m : 5;
                 ProcessRecentTickData(windowId, currentCode, screenNo, minutes, e);
+            }
+            else if (category == "프로그램매매")
+            {
+                int minutes = parts.Length > 4 && int.TryParse(parts[4], out var m) ? m : ProgramTradeDefaultSeedMinutes;
+                ProcessProgramTradeHistoryData(windowId, currentCode, screenNo, minutes, e);
             }
             else if (category == "보유종목조회")
             {
@@ -1406,9 +2539,11 @@ namespace MoneyCreator.Service
             //}
         }
 
-        private void ProcessOrderHistoryData(string windowId, string accountNo, string screenNo, _DKHOpenAPIEvents_OnReceiveTrDataEvent e)
+        private async void ProcessOrderHistoryData(string windowId, string accountNo, string screenNo, _DKHOpenAPIEvents_OnReceiveTrDataEvent e)
         {
             var orders = ParseOrderRows(e);
+            if (orders.Count > 1)
+                orders.Reverse();
 
             string bufferKey = $"{windowId}_{accountNo}_ORDERS";
 
@@ -1425,6 +2560,8 @@ namespace MoneyCreator.Service
 
             if (hasNext)
             {
+                await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
+
                 RequestOrderHistory(
                     windowId,
                     accountNo,
@@ -1439,15 +2576,14 @@ namespace MoneyCreator.Service
 
             lock (buffer)
             {
-                finalOrders = buffer
-                    .Where(x => x != null && !string.IsNullOrWhiteSpace(x.OrderNo))
-                    .GroupBy(x => x.OrderNo)
-                    .Select(g => g
-                        .OrderByDescending(x => x.ExecQty)
-                        .ThenByDescending(x => x.UntradedQty)
-                        .First())
-                    .OrderByDescending(x => x.OrderTime)
-                    .ToList();
+                finalOrders = new List<OrderInfo>(buffer.Count);
+                foreach (var order in buffer)
+                {
+                    if (order == null || string.IsNullOrWhiteSpace(order.OrderNo))
+                        continue;
+
+                    finalOrders.Add(order);
+                }
             }
 
             _orderHistoryBuffer.TryRemove(bufferKey, out _);
@@ -1487,20 +2623,38 @@ namespace MoneyCreator.Service
                         rawCode = symbol.Code;
                 }
 
+                string rawOrderTime = _api.GetCommData(e.sTrCode, e.sRQName, i, "주문시간").Trim();
+                if (string.IsNullOrWhiteSpace(rawOrderTime))
+                    rawOrderTime = _api.GetCommData(e.sTrCode, e.sRQName, i, "시간").Trim();
+
+                int execQty = SafeInt(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결수량"));
+                if (execQty <= 0)
+                    execQty = SafeInt(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결량"));
+
+                double orderPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문단가"));
+                if (orderPrice <= 0)
+                    orderPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문가격"));
+                if (orderPrice <= 0)
+                    orderPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문가"));
+
+                double execPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결단가"));
+                if (execPrice <= 0)
+                    execPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결가"));
+
                 orders.Add(new OrderInfo
                 {
                     OrderNo = rawOrderNo,
                     ParentOrderNo = _api.GetCommData(e.sTrCode, e.sRQName, i, "원주문번호").Trim(),
                     Code = rawCode,
                     Name = name,
-                    OrderTime = NormalizeOrderTime(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문시간").Trim()),
+                    OrderTime = NormalizeOrderTime(rawOrderTime),
                     Status = _api.GetCommData(e.sTrCode, e.sRQName, i, "주문상태").Trim(),
                     OrderType = _api.GetCommData(e.sTrCode, e.sRQName, i, "주문구분").Trim(),
 
                     Qty = SafeInt(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문수량")),
-                    ExecQty = SafeInt(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결수량")),
-                    Price = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "주문단가")),
-                    ExecPrice = SafeDouble(_api.GetCommData(e.sTrCode, e.sRQName, i, "체결단가")),
+                    ExecQty = execQty,
+                    Price = orderPrice,
+                    ExecPrice = execPrice,
                     UntradedQty = SafeInt(_api.GetCommData(e.sTrCode, e.sRQName, i, "미체결수량")),
 
                     StrategyName = "ORDER_TR"
@@ -1589,16 +2743,18 @@ namespace MoneyCreator.Service
                     if (!TryParseMinuteRow(currentCode, rows[i], out var candle))
                         continue;
 
-                    var tod = candle.CandleTime.TimeOfDay;
-
-                    // 장중 분봉만 사용
-                    if (tod < new TimeSpan(9, 0, 0) ||
-                        tod > new TimeSpan(15, 20, 0))
+                    // 분석용 과거분봉은 전일/당일 각각 09:00:00~15:20:59만 사용한다.
+                    if (!IsAnalysisMinuteTime(candle.CandleTime))
                         continue;
 
                     candles.Add(candle);
                 }
             });
+
+            // 키움 히스토리 TR은 최신→과거 역순으로 내려온다.
+            // TR 1회 수신분만 1회 Reverse 후 이후 단계에서는 재정렬하지 않는다.
+            if (candles.Count > 1)
+                candles.Reverse();
 
             if (candles.Count > 0)
                 _dbManager.EnqueueMinuteCandles(candles);
@@ -1606,10 +2762,12 @@ namespace MoneyCreator.Service
             bool hasNext = e.sPrevNext == "2";
 
             bool isMarketOpenNow =
-                DateTime.Now.TimeOfDay >= new TimeSpan(9, 0, 0) &&
-                DateTime.Now.TimeOfDay <= new TimeSpan(15, 20, 0);
+                DateTime.Now.TimeOfDay >= AnalysisMinuteStartTime &&
+                DateTime.Now.TimeOfDay <= AnalysisMinuteEndTime;
 
-            // 장중에는 2일치, 장마감 후에는 당일 1일치만 수집한다.
+            // 차트/분봉 TR 연속조회 범위는 기존 동작을 유지한다.
+            // 장중에는 요청 daysToLoad 기준, 장마감 후에는 최신 거래일 1일치만 수집한다.
+            // 15:20 컷은 분석/히스토리 시간 필터 역할만 하고, 차트 날짜 기준을 daysToLoad=2로 밀지 않는다.
             int effectiveDaysToLoad = isMarketOpenNow ? Math.Max(1, daysToLoad) : 1;
             DateTime targetDate = DateTime.Today.AddDays(-(effectiveDaysToLoad - 1));
 
@@ -1646,6 +2804,8 @@ namespace MoneyCreator.Service
 
             if (canRequestNext)
             {
+                await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
+
                 RequestMinuteCandles(
                     windowId,
                     currentCode,
@@ -1724,7 +2884,9 @@ namespace MoneyCreator.Service
             var ticks = new List<TrackedSymbol>();
             bool shouldStop = false;
             DateTime now = DateTime.Now;
-            int safeMinutes = Math.Max(1, minutes);
+            int safeMinutes = TryResolveReplayTickDateRequest(minutes, out _)
+                ? minutes
+                : Math.Max(1, minutes);
             TickWindowRange range = GetRecentTickWindow(now, safeMinutes);
 
             await Task.Run(() =>
@@ -1734,14 +2896,41 @@ namespace MoneyCreator.Service
                     if (!TryParseRecentTickRow(row, range, now, out DateTime tickTime, out double tickPrice, out int tickVol))
                         continue;
 
-                    // 원하는 10분 구간 밖은 버린다.
-                    if (tickTime > range.End)
-                        continue;
-
-                    if (tickTime < range.Start)
+                    if (range.UseRangeDate)
                     {
-                        shouldStop = true;
-                        break;
+                        DateTime targetDate = range.Start.Date;
+                        DateTime tickDate = tickTime.Date;
+
+                        // Replay 원천틱 수집은 날짜와 09:00~15:20:59 시간대를 모두 확인한다.
+                        if (tickDate > targetDate)
+                            continue;
+
+                        if (tickDate < targetDate)
+                        {
+                            shouldStop = true;
+                            break;
+                        }
+
+                        if (tickTime > range.End)
+                            continue;
+
+                        if (tickTime < range.Start)
+                        {
+                            shouldStop = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // 분석용 과거틱 seed는 15:15:00~15:20:59 구간만 사용한다.
+                        if (tickTime > range.End)
+                            continue;
+
+                        if (tickTime < range.Start)
+                        {
+                            shouldStop = true;
+                            break;
+                        }
                     }
 
                     ticks.Add(new TrackedSymbol
@@ -1753,15 +2942,19 @@ namespace MoneyCreator.Service
                         HighPrice = tickPrice,
                         LowPrice = tickPrice,
                         LastUpdated = tickTime,
-                        Side = tickVol >= 0 ? "B" : "S"
+                        Side = "U"
                     });
                 }
 
-                ticks = ticks
-                    .GroupBy(x => new { x.Code, x.LastUpdated, x.LastPrice, x.LastVolume })
-                    .Select(g => g.First())
-                    .OrderBy(x => x.LastUpdated)
-                    .ToList();
+                // 키움 opt10079는 최신→과거 역순이다.
+                // 현재 TR 배치만 1회 Reverse하고, 이후 병합/정렬은 하지 않는다.
+                if (ticks.Count > 1)
+                    ticks.Reverse();
+
+                // RECENT_TICKS도 opt10079 히스토리 tick이다.
+                // 거래량 부호는 TryParseRecentTickRow에서 절대값 처리되므로 여기서 Side를 만들면 항상 B가 된다.
+                // Reverse 이후 시간 오름차순 상태에서 이전 체결가와 비교해 B/S를 보정한다.
+                ApplyHistoryTickSideByAdjacentPrice(ticks);
             });
 
             bool hasNext = e.sPrevNext == "2";
@@ -1770,10 +2963,452 @@ namespace MoneyCreator.Service
             OnRecentTicksReceived?.Invoke(windowId, currentCode, ticks, isLast);
 
             if (hasNext && !shouldStop)
+            {
+                await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
                 RequestRecentTicksCore(windowId, currentCode, screenNo, safeMinutes, priority: 2, next: 2);
+            }
 
             // RECENT_TICKS 요청 1회에 대한 응답 처리 완료.
             _scheduler?.NotifyResponseReceived(windowId, currentCode, "RECENT_TICKS");
+        }
+
+        private string GetCommDataAny(string trCode, string rqName, int index, params string[] fieldNames)
+        {
+            if (fieldNames == null || fieldNames.Length == 0)
+                return string.Empty;
+
+            foreach (var fieldName in fieldNames)
+            {
+                if (string.IsNullOrWhiteSpace(fieldName))
+                    continue;
+
+                try
+                {
+                    string value = _api.GetCommData(trCode, rqName, index, fieldName).Trim();
+                    if (!string.IsNullOrWhiteSpace(value))
+                        return value;
+                }
+                catch
+                {
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private DateTime ParseProgramTradeTime(string rawTime, DateTime baseDate)
+        {
+            DateTime date = baseDate == default(DateTime) ? DateTime.Today : baseDate.Date;
+
+            if (string.IsNullOrWhiteSpace(rawTime))
+                return DateTime.MinValue;
+
+            rawTime = rawTime.Trim();
+
+            DateTime parsed;
+            if (DateTime.TryParseExact(rawTime, "yyyyMMddHHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                return parsed;
+
+            if (DateTime.TryParseExact(rawTime, "HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                return date.Add(parsed.TimeOfDay);
+
+            if (DateTime.TryParseExact(rawTime, "HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                return date.Add(parsed.TimeOfDay);
+
+            if (DateTime.TryParseExact(rawTime, "HHmm", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                return date.Add(parsed.TimeOfDay);
+
+            return DateTime.MinValue;
+        }
+
+        private static bool IsValidProgramTradeTime(DateTime time)
+        {
+            if (time == default(DateTime) || time == DateTime.MinValue)
+                return false;
+
+            TimeSpan tod = time.TimeOfDay;
+            return tod >= ProgramTradeStartTime && tod <= ProgramTradeEndTime;
+        }
+
+        private static string ResolveProgramTradeDirection(long netAmountDelta, long netQuantityDelta, long netAmount)
+        {
+            long basis = netAmountDelta != 0 ? netAmountDelta : netQuantityDelta;
+
+            if (basis > 0)
+                return "Buy";
+
+            if (basis < 0)
+                return "Sell";
+
+            if (netAmount > 0)
+                return "BuyHold";
+
+            if (netAmount < 0)
+                return "SellHold";
+
+            return "Flat";
+        }
+
+        private ProgramFlowSnapshotRecord BuildProgramFlowSnapshot(string code, DateTime snapshotTime, List<ProgramTradeInfo> buffer, string sourceState)
+        {
+            if (string.IsNullOrWhiteSpace(code) || buffer == null || buffer.Count == 0)
+                return null;
+
+            var ordered = buffer
+                .Where(x => x != null && x.TradeTime != default(DateTime))
+                .OrderBy(x => x.TradeTime)
+                .ToList();
+
+            if (ordered.Count == 0)
+                return null;
+
+            var latest = ordered.LastOrDefault(x => x.TradeTime <= snapshotTime) ?? ordered.Last();
+
+            long amount1 = ResolveProgramDeltaAmount(ordered, latest, TimeSpan.FromMinutes(1));
+            long amount3 = ResolveProgramDeltaAmount(ordered, latest, TimeSpan.FromMinutes(3));
+            long amount5 = ResolveProgramDeltaAmount(ordered, latest, TimeSpan.FromMinutes(5));
+            long amount10 = ResolveProgramDeltaAmount(ordered, latest, TimeSpan.FromMinutes(10));
+
+            long qty1 = ResolveProgramDeltaQuantity(ordered, latest, TimeSpan.FromMinutes(1));
+            long qty3 = ResolveProgramDeltaQuantity(ordered, latest, TimeSpan.FromMinutes(3));
+            long qty5 = ResolveProgramDeltaQuantity(ordered, latest, TimeSpan.FromMinutes(5));
+            long qty10 = ResolveProgramDeltaQuantity(ordered, latest, TimeSpan.FromMinutes(10));
+
+            bool warmedUp = ordered.Any(x => x.TradeTime <= latest.TradeTime.AddMinutes(-ProgramTradeUiWarmupMinutes));
+            double score = CalculateProgramFlowScore(amount1, amount3, amount5, amount10, qty1, qty3, qty5, qty10);
+            string direction = ResolveProgramFlowDirection(score, warmedUp);
+
+            return new ProgramFlowSnapshotRecord
+            {
+                SnapshotId = $"PF_{code}_{latest.TradeTime:yyyyMMddHHmmss}_{NormalizeProgramSourceKey(sourceState)}",
+                Code = code,
+                SnapshotTime = latest.TradeTime,
+                LatestNetAmount = latest.ProgramNetAmount,
+                LatestNetQuantity = latest.ProgramNetQuantity,
+                Delta1mAmount = amount1,
+                Delta3mAmount = amount3,
+                Delta5mAmount = amount5,
+                Delta10mAmount = amount10,
+                Delta1mQuantity = qty1,
+                Delta3mQuantity = qty3,
+                Delta5mQuantity = qty5,
+                Delta10mQuantity = qty10,
+                FlowScore = score,
+                FlowDirection = direction,
+                IsWarmedUp = warmedUp,
+                SourceState = sourceState,
+                CreatedAt = DateTime.Now
+            };
+        }
+
+        private static long ResolveProgramDeltaAmount(List<ProgramTradeInfo> ordered, ProgramTradeInfo latest, TimeSpan span)
+        {
+            if (ordered == null || latest == null)
+                return 0;
+
+            DateTime target = latest.TradeTime - span;
+            var baseline = ordered.LastOrDefault(x => x.TradeTime <= target) ?? ordered.FirstOrDefault();
+
+            if (baseline == null)
+                return 0;
+
+            return latest.ProgramNetAmount - baseline.ProgramNetAmount;
+        }
+
+        private static long ResolveProgramDeltaQuantity(List<ProgramTradeInfo> ordered, ProgramTradeInfo latest, TimeSpan span)
+        {
+            if (ordered == null || latest == null)
+                return 0;
+
+            DateTime target = latest.TradeTime - span;
+            var baseline = ordered.LastOrDefault(x => x.TradeTime <= target) ?? ordered.FirstOrDefault();
+
+            if (baseline == null)
+                return 0;
+
+            return latest.ProgramNetQuantity - baseline.ProgramNetQuantity;
+        }
+
+        private static double CalculateProgramFlowScore(long amount1, long amount3, long amount5, long amount10, long qty1, long qty3, long qty5, long qty10)
+        {
+            double amountScore = 0;
+
+            amountScore += NormalizeProgramAmountScore(amount1) * 0.35;
+            amountScore += NormalizeProgramAmountScore(amount3) * 0.30;
+            amountScore += NormalizeProgramAmountScore(amount5) * 0.20;
+            amountScore += NormalizeProgramAmountScore(amount10) * 0.15;
+
+            double quantityScore = 0;
+            quantityScore += NormalizeProgramQuantityScore(qty1) * 0.35;
+            quantityScore += NormalizeProgramQuantityScore(qty3) * 0.30;
+            quantityScore += NormalizeProgramQuantityScore(qty5) * 0.20;
+            quantityScore += NormalizeProgramQuantityScore(qty10) * 0.15;
+
+            double score = amountScore * 0.7 + quantityScore * 0.3;
+
+            if (score > 100) score = 100;
+            if (score < -100) score = -100;
+
+            return score;
+        }
+
+        private static double NormalizeProgramAmountScore(long amount)
+        {
+            const double oneHundredMillion = 100000000.0;
+            return Math.Max(-100, Math.Min(100, amount / oneHundredMillion * 10.0));
+        }
+
+        private static double NormalizeProgramQuantityScore(long quantity)
+        {
+            const double baseQuantity = 10000.0;
+            return Math.Max(-100, Math.Min(100, quantity / baseQuantity * 10.0));
+        }
+
+        private static string ResolveProgramFlowDirection(double score, bool warmedUp)
+        {
+            if (!warmedUp)
+                return "WarmUp";
+
+            if (score >= 20)
+                return "BuyFlow";
+
+            if (score <= -20)
+                return "SellFlow";
+
+            return "Flat";
+        }
+
+        private ProgramFlowSnapshotRecord AddProgramTradeAndPublish(string windowId, ProgramTradeInfo trade)
+        {
+            if (trade == null || string.IsNullOrWhiteSpace(trade.Code))
+                return null;
+
+            if (!IsValidProgramTradeTime(trade.TradeTime))
+                return null;
+
+            if (trade.CreatedAt == default(DateTime))
+                trade.CreatedAt = DateTime.Now;
+
+            if (string.IsNullOrWhiteSpace(trade.Direction))
+                trade.Direction = ResolveProgramTradeDirection(trade.ProgramNetAmountDelta, trade.ProgramNetQuantityDelta, trade.ProgramNetAmount);
+
+            List<ProgramTradeInfo> snapshotBuffer;
+
+            lock (_programTradeLock)
+            {
+                var buffer = _programTradeBuffers.GetOrAdd(trade.Code, _ => new List<ProgramTradeInfo>());
+
+                buffer.RemoveAll(x =>
+                    x != null &&
+                    x.TradeTime == trade.TradeTime &&
+                    string.Equals(x.Source, trade.Source, StringComparison.OrdinalIgnoreCase));
+
+                buffer.Add(trade);
+                buffer.Sort((a, b) => a.TradeTime.CompareTo(b.TradeTime));
+
+                DateTime keepFrom = trade.TradeTime.AddMinutes(-Math.Max(30, ProgramTradeDefaultSeedMinutes + 10));
+                buffer.RemoveAll(x => x == null || x.TradeTime < keepFrom);
+
+                snapshotBuffer = buffer.ToList();
+            }
+
+            var flow = BuildProgramFlowSnapshot(trade.Code, trade.TradeTime, snapshotBuffer, trade.Source);
+
+            // REALTIME뿐 아니라 TR_SEED도 Replay/분석 재현용 원천 데이터다.
+            // DB 쪽은 Source와 결정적 SnapshotId 기준으로 중복을 upsert하므로 저장 경로에서 제거하지 않는다.
+            if (IsPersistableProgramTradeSource(trade.Source))
+            {
+                _dbManager?.EnqueueProgramTrade(trade);
+                if (flow != null)
+                    _dbManager?.EnqueueProgramFlowSnapshot(flow);
+            }
+
+            OnProgramTradeReceived?.Invoke(windowId ?? "COMMON", trade, flow);
+            return flow;
+        }
+
+        private static string NormalizeProgramSourceKey(string source)
+        {
+            string value = string.IsNullOrWhiteSpace(source) ? "UNKNOWN" : source.Trim().ToUpperInvariant();
+            var chars = value
+                .Select(ch => char.IsLetterOrDigit(ch) ? ch : '_')
+                .ToArray();
+
+            return new string(chars);
+        }
+
+        private static bool IsPersistableProgramTradeSource(string source)
+        {
+            string value = (source ?? string.Empty).Trim();
+
+            return string.Equals(value, "REALTIME", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "TR_SEED", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void ParseAndSendProgramTrade(string windowId, string code, string source)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(code))
+                    return;
+
+                string rawTime = _api.GetCommRealData(code, FidProgramTime).Trim();
+                DateTime tradeTime = ParseProgramTradeTime(rawTime, DateTime.Today);
+
+                if (!IsValidProgramTradeTime(tradeTime))
+                {
+                    DateTime now = DateTime.Now;
+                    if (!IsValidProgramTradeTime(now))
+                        return;
+
+                    tradeTime = now;
+                    Debug.WriteLine($"[프로그램매매 실시간] 시간 FID 누락/오류 - 현재시각 대체: {code} / raw={rawTime}");
+                }
+
+                var trade = new ProgramTradeInfo
+                {
+                    Code = code,
+                    Name = string.Empty,
+                    TradeTime = tradeTime,
+                    CurrentPrice = Math.Abs(SafeSignedDouble(_api.GetCommRealData(code, FidProgramCurrentPrice).Trim())),
+                    Volume = Math.Abs(SafeSignedLong(_api.GetCommRealData(code, FidProgramVolume).Trim())),
+                    ProgramSellAmount = Math.Abs(SafeSignedLong(_api.GetCommRealData(code, FidProgramSellAmount).Trim())),
+                    ProgramBuyAmount = Math.Abs(SafeSignedLong(_api.GetCommRealData(code, FidProgramBuyAmount).Trim())),
+                    ProgramNetAmount = SafeSignedLong(_api.GetCommRealData(code, FidProgramNetAmount).Trim()),
+                    ProgramNetAmountDelta = SafeSignedLong(_api.GetCommRealData(code, FidProgramNetAmountDelta).Trim()),
+                    ProgramSellQuantity = Math.Abs(SafeSignedLong(_api.GetCommRealData(code, FidProgramSellQuantity).Trim())),
+                    ProgramBuyQuantity = Math.Abs(SafeSignedLong(_api.GetCommRealData(code, FidProgramBuyQuantity).Trim())),
+                    ProgramNetQuantity = SafeSignedLong(_api.GetCommRealData(code, FidProgramNetQuantity).Trim()),
+                    ProgramNetQuantityDelta = SafeSignedLong(_api.GetCommRealData(code, FidProgramNetQuantityDelta).Trim()),
+                    Source = string.IsNullOrWhiteSpace(source) ? "REALTIME" : source,
+                    CreatedAt = DateTime.Now
+                };
+
+                trade.Direction = ResolveProgramTradeDirection(
+                    trade.ProgramNetAmountDelta,
+                    trade.ProgramNetQuantityDelta,
+                    trade.ProgramNetAmount);
+
+                AddProgramTradeAndPublish(windowId, trade);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[프로그램매매 실시간 파싱 오류] {code} / {ex.Message}");
+                OnLog?.Invoke(windowId ?? "COMMON", $"[프로그램매매 실시간 파싱 오류] {code} / {ex.Message}");
+            }
+        }
+
+        private async void ProcessProgramTradeHistoryData(
+            string windowId,
+            string currentCode,
+            string screenNo,
+            int minutes,
+            _DKHOpenAPIEvents_OnReceiveTrDataEvent e)
+        {
+            int count = 0;
+            var rows = new List<ProgramTradeInfo>();
+            DateTime now = DateTime.Now;
+            int safeMinutes = Math.Max(1, minutes);
+            DateTime effectiveEndTime = now;
+            DateTime programCutoffTime = now.Date.Add(ProgramTradeEndTime);
+
+            // 장 마감 노이즈 컷 기준은 15:20이다.
+            // 15:20 이후 실행해도 최근 N분 기준은 현재 시간이 아니라 15:20을 기준으로 잡아야 한다.
+            if (effectiveEndTime.TimeOfDay > ProgramTradeEndTime)
+                effectiveEndTime = programCutoffTime;
+
+            DateTime fromTime = effectiveEndTime.AddMinutes(-safeMinutes);
+            bool reachedWindowStart = false;
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                count = _api.GetRepeatCnt(e.sTrCode, e.sRQName);
+
+                for (int i = 0; i < count; i++)
+                {
+                    string rawTime = GetCommDataAny(e.sTrCode, e.sRQName, i, "시간", "체결시간", "일자시간");
+                    DateTime tradeTime = ParseProgramTradeTime(rawTime, now.Date);
+
+                    if (!IsValidProgramTradeTime(tradeTime))
+                        continue;
+
+                    if (tradeTime > effectiveEndTime)
+                        continue;
+
+                    if (tradeTime < fromTime)
+                    {
+                        reachedWindowStart = true;
+                        continue;
+                    }
+
+                    rows.Add(new ProgramTradeInfo
+                    {
+                        Code = currentCode,
+                        Name = GetCommDataAny(e.sTrCode, e.sRQName, i, "종목명"),
+                        TradeTime = tradeTime,
+                        CurrentPrice = Math.Abs(SafeSignedDouble(GetCommDataAny(e.sTrCode, e.sRQName, i, "현재가"))),
+                        Volume = Math.Abs(SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "거래량", "누적거래량"))),
+                        ProgramSellAmount = Math.Abs(SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램매도금액", "매도금액"))),
+                        ProgramBuyAmount = Math.Abs(SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램매수금액", "매수금액"))),
+                        ProgramNetAmount = SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램순매수금액", "순매수금액")),
+                        ProgramNetAmountDelta = SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램순매수금액증감", "순매수금액증감")),
+                        ProgramSellQuantity = Math.Abs(SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램매도수량", "매도수량"))),
+                        ProgramBuyQuantity = Math.Abs(SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램매수수량", "매수수량"))),
+                        ProgramNetQuantity = SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램순매수수량", "순매수수량")),
+                        ProgramNetQuantityDelta = SafeSignedLong(GetCommDataAny(e.sTrCode, e.sRQName, i, "프로그램순매수수량증감", "순매수수량증감")),
+                        Source = "TR_SEED",
+                        CreatedAt = DateTime.Now
+                    });
+                }
+            });
+
+            OnLog?.Invoke(windowId, $"[프로그램매매] TR 응답: {currentCode} / count={count} / rows={rows.Count} / window={fromTime:HH:mm:ss}~{effectiveEndTime:HH:mm:ss} / prevNext={e.sPrevNext}");
+
+            if (count == 0)
+            {
+                // 실제 프로그램매매 데이터가 아니므로 UI/DB에 상태 행을 추가하지 않는다.
+                OnLog?.Invoke(windowId, $"[프로그램매매] TR 응답 0건 - UI 데이터 미추가: {currentCode}");
+
+                _scheduler?.NotifyResponseReceived(windowId, currentCode, "PROGRAM_TRADE");
+                return;
+            }
+
+            if (rows.Count == 0)
+            {
+                // 15:20 이후/분석창 밖 데이터는 노이즈로 컷한다.
+                // 컷 결과는 로그로만 남기고 ProgramTrades/UI/DB에는 넣지 않는다.
+                OnLog?.Invoke(windowId, $"[프로그램매매] TR 필터 후 0건 - UI 데이터 미추가: {currentCode} / window={fromTime:HH:mm:ss}~{effectiveEndTime:HH:mm:ss}");
+
+                bool hasNextForFiltered = e.sPrevNext == "2";
+                if (hasNextForFiltered && !reachedWindowStart)
+                {
+                    await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
+                    RequestProgramTradeHistory(windowId, currentCode, screenNo, safeMinutes, priority: 2, next: 2);
+                }
+
+                _scheduler?.NotifyResponseReceived(windowId, currentCode, "PROGRAM_TRADE");
+                return;
+            }
+
+            foreach (var trade in rows.OrderBy(x => x.TradeTime))
+            {
+                trade.Direction = ResolveProgramTradeDirection(
+                    trade.ProgramNetAmountDelta,
+                    trade.ProgramNetQuantityDelta,
+                    trade.ProgramNetAmount);
+
+                AddProgramTradeAndPublish(windowId, trade);
+            }
+
+            bool hasNext = e.sPrevNext == "2";
+
+            if (hasNext && !reachedWindowStart)
+            {
+                await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
+                RequestProgramTradeHistory(windowId, currentCode, screenNo, safeMinutes, priority: 2, next: 2);
+            }
+
+            _scheduler?.NotifyResponseReceived(windowId, currentCode, "PROGRAM_TRADE");
         }
 
         private double CleanDouble(string value)
@@ -1813,37 +3448,25 @@ namespace MoneyCreator.Service
 
             List<TrackedSymbol> currentTrHistory = new List<TrackedSymbol>();
             bool shouldStop = false;
+            DateTime now = DateTime.Now;
+            TickWindowRange range = GetRecentTickWindow(now, 5);
 
             await Task.Run(() =>
             {
-                DateTime now = DateTime.Now;
-
-                if (!TryParseData(rawDataRows[0], now, out DateTime firstDataTime, out _, out _))
-                    return;
-
-                DateTime pivotTime = new DateTime(
-                    firstDataTime.Year,
-                    firstDataTime.Month,
-                    firstDataTime.Day,
-                    9, 0, 0);
-
-                TimeSpan endLimit = new TimeSpan(15, 20, 0);
-
                 foreach (var row in rawDataRows)
                 {
-                    if (!TryParseData(row, now, out DateTime pTime, out double pPrice, out int pVol))
+                    if (!TryParseRecentTickRow(row, range, now, out DateTime pTime, out double pPrice, out int pVol))
                         continue;
 
-                    // 오늘 장 시작 이전 데이터가 나오면 더 이상 과거 조회 중단
-                    if (pTime < pivotTime)
+                    // 분석용 과거틱은 15:20 종가 구간 -5분으로 통일한다.
+                    if (pTime > range.End)
+                        continue;
+
+                    if (pTime < range.Start)
                     {
                         shouldStop = true;
                         break;
                     }
-
-                    // 15:20 이후 데이터는 무시
-                    if (pTime.TimeOfDay >= endLimit)
-                        continue;
 
                     currentTrHistory.Add(new TrackedSymbol
                     {
@@ -1858,24 +3481,94 @@ namespace MoneyCreator.Service
                     });
                 }
 
-                currentTrHistory = currentTrHistory.OrderBy(x => x.LastUpdated).ToList();
+                // 키움 과거틱 TR 1회 수신분만 1회 Reverse한다.
+                // 정렬 순서는 기존 그대로 유지한다.
+                if (currentTrHistory.Count > 1)
+                    currentTrHistory.Reverse();
+
+                // opt10079 과거틱은 거래량만 내려오는 구간이 있어 Side를 원천에서 확정할 수 없다.
+                // Reverse 이후 시간 오름차순 상태에서 이전 체결가와 비교해 B/S를 보정한다.
+                ApplyHistoryTickSideByAdjacentPrice(currentTrHistory);
             });
 
             bool hasNext = e.sPrevNext == "2";
 
             // 중요:
-            // islast는 "다음 페이지가 없음" 또는 "오늘 09:00 이전까지 도달해서 중단"이면 true
+            // islast는 "다음 페이지가 없음" 또는 "15:15 이전까지 도달해서 중단"이면 true
             bool isLast = !hasNext || shouldStop;
 
             OnInitialHistoryReceived?.Invoke(windowId, currentTrHistory, isLast);
 
             if (hasNext && !shouldStop)
             {
+                await DelayBeforeContinuousTrRequestAsync().ConfigureAwait(false);
                 RequestPreviousData(windowId, currentCode, 2, screenNo, 2);
             }
 
             // PREV 요청 1회에 대한 응답 처리 완료.
             _scheduler?.NotifyResponseReceived(windowId, currentCode, "PREV");
+        }
+
+        private static void ApplyHistoryTickSideByAdjacentPrice(List<TrackedSymbol> ticks)
+        {
+            if (ticks == null || ticks.Count == 0)
+                return;
+
+            double? previousPrice = null;
+            string previousSide = null;
+
+            for (int i = 0; i < ticks.Count; i++)
+            {
+                var tick = ticks[i];
+                if (tick == null)
+                    continue;
+
+                string side = null;
+
+                if (previousPrice.HasValue)
+                {
+                    if (tick.LastPrice > previousPrice.Value)
+                        side = "B";
+                    else if (tick.LastPrice < previousPrice.Value)
+                        side = "S";
+                    else
+                        side = previousSide;
+                }
+
+                // TR 배치의 첫 tick은 이전가격이 없다.
+                // 이 경우에만 다음 tick 방향으로 보정하고, 전부 같은 가격이면 B로 둔다.
+                if (string.IsNullOrWhiteSpace(side))
+                    side = ResolveFirstHistoryTickSide(ticks, i);
+
+                tick.Side = side;
+                previousPrice = tick.LastPrice;
+                previousSide = side;
+            }
+        }
+
+        private static string ResolveFirstHistoryTickSide(List<TrackedSymbol> ticks, int index)
+        {
+            var current = ticks == null || index < 0 || index >= ticks.Count
+                ? null
+                : ticks[index];
+
+            if (current == null)
+                return "B";
+
+            for (int i = index + 1; i < ticks.Count; i++)
+            {
+                var next = ticks[i];
+                if (next == null)
+                    continue;
+
+                if (next.LastPrice > current.LastPrice)
+                    return "B";
+
+                if (next.LastPrice < current.LastPrice)
+                    return "S";
+            }
+
+            return "B";
         }
 
         private bool TryParseData(string[] row, DateTime now, out DateTime pTime, out double pPrice, out int pVol)
@@ -1929,6 +3622,364 @@ namespace MoneyCreator.Service
 
             return true;
         }
+        private void StartConnectionMonitor()
+        {
+            AttachApplicationShutdownGuard();
+
+            if (IsKiwoomComShutdownInProgress())
+                return;
+
+            if (Interlocked.Exchange(ref _connectionMonitorStarted, 1) == 1)
+                return;
+
+            Interlocked.Exchange(ref _connectionMonitorStopped, 0);
+
+            lock (_connectionMonitorLock)
+            {
+                if (_connectionMonitorTimer != null)
+                {
+                    try
+                    {
+                        _connectionMonitorTimer.Change(
+                            ConnectionMonitorIntervalMilliseconds,
+                            ConnectionMonitorIntervalMilliseconds);
+                        return;
+                    }
+                    catch
+                    {
+                        _connectionMonitorTimer = null;
+                    }
+                }
+
+                _connectionMonitorTimer = new System.Threading.Timer(
+                    CheckConnectionState,
+                    null,
+                    ConnectionMonitorIntervalMilliseconds,
+                    ConnectionMonitorIntervalMilliseconds);
+            }
+        }
+
+        private void AttachApplicationShutdownGuard()
+        {
+            if (Interlocked.Exchange(ref _shutdownGuardAttached, 1) == 1)
+                return;
+
+            try
+            {
+                var app = System.Windows.Application.Current;
+                if (app != null)
+                {
+                    app.Exit += (s, e) => MarkKiwoomComShutdown("ApplicationExit");
+
+                    var dispatcher = app.Dispatcher;
+                    if (dispatcher != null)
+                        dispatcher.ShutdownStarted += (s, e) => MarkKiwoomComShutdown("DispatcherShutdownStarted");
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                AppDomain.CurrentDomain.ProcessExit += (s, e) => MarkKiwoomComShutdown("ProcessExit");
+            }
+            catch
+            {
+            }
+        }
+
+        public void BeginShutdown(string reason = "ManualShutdown")
+        {
+            MarkKiwoomComShutdown(reason);
+        }
+
+        private void MarkKiwoomComShutdown(string reason)
+        {
+            Interlocked.Exchange(ref _kiwoomComShutdownInProgress, 1);
+            StopConnectionMonitorForDetachedCom(reason);
+        }
+
+        private bool IsKiwoomComShutdownInProgress()
+        {
+            if (Interlocked.CompareExchange(ref _kiwoomComShutdownInProgress, 0, 0) == 1)
+                return true;
+
+            return IsWpfDispatcherShutdownStarted();
+        }
+
+        private static bool IsWpfDispatcherShutdownStarted()
+        {
+            try
+            {
+                var app = System.Windows.Application.Current;
+                var dispatcher = app == null ? null : app.Dispatcher;
+                return dispatcher == null || dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private void StopConnectionMonitorForDetachedCom(string reason)
+        {
+            Interlocked.Exchange(ref _connectionMonitorStopped, 1);
+
+            lock (_connectionMonitorLock)
+            {
+                var timer = _connectionMonitorTimer;
+                _connectionMonitorTimer = null;
+
+                if (timer != null)
+                {
+                    try
+                    {
+                        timer.Change(Timeout.Infinite, Timeout.Infinite);
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        timer.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            Interlocked.Exchange(ref _connectionMonitorStarted, 0);
+            Interlocked.Exchange(ref _disconnectHitCount, 0);
+            Interlocked.Exchange(ref _connectionLostRaised, 0);
+            Interlocked.Exchange(ref _reconnectInProgress, 0);
+
+            if (!string.IsNullOrWhiteSpace(reason) &&
+                !reason.Equals("ApplicationExit", StringComparison.OrdinalIgnoreCase) &&
+                !reason.Equals("ProcessExit", StringComparison.OrdinalIgnoreCase) &&
+                !reason.Equals("DispatcherShutdownStarted", StringComparison.OrdinalIgnoreCase))
+            {
+                OnLog?.Invoke("SYSTEM", "[키움 연결감시] COM 객체 분리로 감시 중지: " + reason);
+            }
+        }
+
+        private int GetConnectStateOnDispatcher(AxKHOpenAPI api)
+        {
+            if (api == null || IsKiwoomComShutdownInProgress())
+                return 0;
+
+            var app = System.Windows.Application.Current;
+            var dispatcher = app == null ? null : app.Dispatcher;
+            if (dispatcher == null || dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            {
+                MarkKiwoomComShutdown("DispatcherShutdown");
+                return 0;
+            }
+
+            int connectState = 0;
+
+            if (dispatcher.CheckAccess())
+            {
+                if (api.IsDisposed || !api.IsHandleCreated)
+                    return 0;
+
+                return api.GetConnectState();
+            }
+
+            dispatcher.Invoke(
+                new Action(() =>
+                {
+                    if (IsKiwoomComShutdownInProgress())
+                        return;
+
+                    if (api == null || api.IsDisposed || !api.IsHandleCreated)
+                        return;
+
+                    connectState = api.GetConnectState();
+                }),
+                DispatcherPriority.Send);
+
+            return connectState;
+        }
+
+        private void CheckConnectionState(object state)
+        {
+            if (IsKiwoomComShutdownInProgress())
+                return;
+
+            if (Interlocked.CompareExchange(ref _connectionMonitorStopped, 0, 0) == 1)
+                return;
+
+            var api = _api;
+            if (api == null)
+                return;
+
+            int connectState = 0;
+
+            try
+            {
+                connectState = GetConnectStateOnDispatcher(api);
+            }
+            catch (System.Runtime.InteropServices.InvalidComObjectException ex)
+            {
+                Debug.WriteLine($"[키움 연결감시] COM 객체 분리 감지 - 감시 중지: {ex.Message}");
+                MarkKiwoomComShutdown("InvalidComObjectException");
+                return;
+            }
+            catch (ObjectDisposedException ex)
+            {
+                Debug.WriteLine($"[키움 연결감시] ActiveX Dispose 감지 - 감시 중지: {ex.Message}");
+                MarkKiwoomComShutdown("ObjectDisposedException");
+                return;
+            }
+            catch (InvalidOperationException ex)
+            {
+                if (IsKiwoomComShutdownInProgress() || IsWpfDispatcherShutdownStarted())
+                {
+                    Debug.WriteLine($"[키움 연결감시] Dispatcher 종료 감지 - 감시 중지: {ex.Message}");
+                    MarkKiwoomComShutdown("DispatcherInvalidOperation");
+                    return;
+                }
+
+                Debug.WriteLine($"[키움 연결감시] GetConnectState 실패: {ex.Message}");
+                connectState = 0;
+            }
+            catch (Exception ex)
+            {
+                if (IsKiwoomComShutdownInProgress() || IsWpfDispatcherShutdownStarted())
+                    return;
+
+                Debug.WriteLine($"[키움 연결감시] GetConnectState 실패: {ex.Message}");
+                connectState = 0;
+            }
+
+            if (IsKiwoomComShutdownInProgress())
+                return;
+
+            if (connectState == 1)
+            {
+                Interlocked.Exchange(ref _hasConnectedOnce, 1);
+                Interlocked.Exchange(ref _disconnectHitCount, 0);
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _hasConnectedOnce, 0, 0) == 0)
+                return;
+
+            int lostCount = Interlocked.Increment(ref _disconnectHitCount);
+            if (lostCount < ConnectionLostConfirmCount)
+                return;
+
+            if (Interlocked.CompareExchange(ref _connectionLostRaised, 1, 0) == 0)
+            {
+                OnLog?.Invoke("SYSTEM", "[재연결] 키움 연결 끊김 감지 - 현재 창 상태 저장/초기화 요청");
+                OnConnectionLost?.Invoke();
+            }
+
+            TryReconnect();
+        }
+
+        private void TryReconnect()
+        {
+            if (IsKiwoomComShutdownInProgress())
+                return;
+
+            if (Interlocked.CompareExchange(ref _reconnectInProgress, 1, 0) != 0)
+                return;
+
+            DateTime now = DateTime.Now;
+            if ((now - _lastReconnectAttemptAt).TotalSeconds < ReconnectRetrySeconds)
+            {
+                Interlocked.Exchange(ref _reconnectInProgress, 0);
+                return;
+            }
+
+            _lastReconnectAttemptAt = now;
+            OnLog?.Invoke("SYSTEM", "[재연결] 키움 CommConnect 재시도");
+
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null)
+            {
+                Interlocked.Exchange(ref _reconnectInProgress, 0);
+                return;
+            }
+
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    if (IsKiwoomComShutdownInProgress())
+                    {
+                        Interlocked.Exchange(ref _reconnectInProgress, 0);
+                        return;
+                    }
+
+                    if (_api == null || _api.IsDisposed)
+                    {
+                        Interlocked.Exchange(ref _reconnectInProgress, 0);
+                        return;
+                    }
+
+                    if (!_api.IsHandleCreated)
+                        _api.CreateControl();
+
+                    _api.CommConnect();
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.Exchange(ref _reconnectInProgress, 0);
+                    OnLog?.Invoke("SYSTEM", $"[재연결] CommConnect 실패: {ex.Message}");
+                }
+            }));
+        }
+
+        public void RestoreRealtimeSubscriptionsAfterReconnect()
+        {
+            if (_api == null)
+                return;
+
+            var codes = _windowSubscriptions.Values
+                .Where(x =>
+                    x != null &&
+                    !string.IsNullOrWhiteSpace(x.Code))
+                .Select(x => x.Code.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+            {
+                if (!IsRealtimeApiReady())
+                    return;
+
+                Interlocked.Exchange(ref _marketIndexRegistered, 0);
+                RegisterMarketIndexRealtime("SYSTEM");
+
+                // 재연결 후 키움 서버의 실시간 등록은 소실된 상태로 본다.
+                // 종목별 소비자 수와 무관하게 각 종목을 전체 FID 58개로 정확히 1회 복원한다.
+                _unifiedSymbolRealtimeRegistered.Clear();
+
+                foreach (string code in codes)
+                {
+                    var representative = GetUnifiedRealtimeRepresentative(code);
+                    if (representative == null)
+                        continue;
+
+                    int result = EnsureUnifiedSymbolRealtimeRegistration(
+                        representative.WindowId ?? "COMMON",
+                        code,
+                        reason: "ReconnectRestore/UnifiedSymbol",
+                        forceReset: true);
+
+                    OnLog?.Invoke(
+                        representative.WindowId ?? "COMMON",
+                        $"[재연결] 종목별 통합 실시간 재등록: {code} / screen={representative.ScreenNo} / fullFids=Y / result={result}");
+                }
+            });
+        }
+
+
         public void RegisterMarketIndexRealtime(string windowId)
         {
             if (Interlocked.Exchange(ref _marketIndexRegistered, 1) == 1)
@@ -1981,6 +4032,9 @@ namespace MoneyCreator.Service
                 return false;
             }
 
+            if (IsKiwoomComShutdownInProgress())
+                return false;
+
             if (!_api.IsHandleCreated)
                 _api.CreateControl();
 
@@ -1990,9 +4044,62 @@ namespace MoneyCreator.Service
 
         public bool IsConnected()
         {
-            return _api != null && _api.GetConnectState() == 1;
+            if (_api == null || IsKiwoomComShutdownInProgress())
+                return false;
+
+            try
+            {
+                return GetConnectStateOnDispatcher(_api) == 1;
+            }
+            catch (System.Runtime.InteropServices.InvalidComObjectException)
+            {
+                MarkKiwoomComShutdown("IsConnectedInvalidComObject");
+                return false;
+            }
+            catch (ObjectDisposedException)
+            {
+                MarkKiwoomComShutdown("IsConnectedObjectDisposed");
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
         }
-        private void Api_OnEventConnect(object sender, _DKHOpenAPIEvents_OnEventConnectEvent e) { if (e.nErrCode == 0) { OnLog?.Invoke("SYSTEM", "✅ 로그인 성공!"); _api.GetConditionLoad(); OnLogin?.Invoke(true); } }
+        private void Api_OnEventConnect(object sender, _DKHOpenAPIEvents_OnEventConnectEvent e)
+        {
+            if (IsKiwoomComShutdownInProgress())
+                return;
+
+            if (e.nErrCode == 0)
+            {
+                bool wasConnectionLost = Interlocked.Exchange(ref _connectionLostRaised, 0) == 1;
+                bool wasReconnectInProgress = Interlocked.Exchange(ref _reconnectInProgress, 0) == 1;
+
+                Interlocked.Exchange(ref _hasConnectedOnce, 1);
+                Interlocked.Exchange(ref _disconnectHitCount, 0);
+
+                OnLog?.Invoke("SYSTEM", wasConnectionLost || wasReconnectInProgress
+                    ? "✅ 키움 재연결 성공"
+                    : "✅ 로그인 성공!");
+
+                _api.GetConditionLoad();
+
+                if (wasConnectionLost || wasReconnectInProgress)
+                    RestoreRealtimeSubscriptionsAfterReconnect();
+
+                OnLogin?.Invoke(true);
+
+                if (wasConnectionLost || wasReconnectInProgress)
+                    OnReconnected?.Invoke();
+
+                return;
+            }
+
+            Interlocked.Exchange(ref _reconnectInProgress, 0);
+            OnLog?.Invoke("SYSTEM", $"❌ 로그인 실패 / 오류코드={e.nErrCode}");
+            OnLogin?.Invoke(false);
+        }
         private void UpdateTradeData(TrackedSymbol tick) { _trackedSymbols.AddOrUpdate(tick.Code, (k) => tick, (k, existing) => { existing.LastPrice = tick.LastPrice; existing.LastVolume = tick.LastVolume; existing.AccumulatedVolume = tick.AccumulatedVolume; existing.Strength = tick.Strength; existing.LastUpdated = tick.LastUpdated; return existing; }); }
         private void Api_OnReceiveRealCondition(object sender, _DKHOpenAPIEvents_OnReceiveRealConditionEvent e) { OnSymbolDetected?.Invoke(e.strConditionName, e.sTrCode, _api.GetMasterCodeName(e.sTrCode)); }
         private void Api_OnReceiveTrCondition(object sender, _DKHOpenAPIEvents_OnReceiveTrConditionEvent e) { string[] codes = e.strCodeList.Split(';').Where(x => !string.IsNullOrEmpty(x)).ToArray(); foreach (var code in codes) OnSymbolDetected?.Invoke(e.sScrNo, code.Trim(), _api.GetMasterCodeName(code.Trim())); }
@@ -2017,29 +4124,33 @@ namespace MoneyCreator.Service
                 return;
 
             var targets = _windowSubscriptions
-                .Where(x => x.Value != null && x.Value.WindowId == windowId)
+                .Where(x =>
+                    x.Value != null &&
+                    string.Equals(x.Value.WindowId, windowId, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            foreach (var item in targets)
-            {
-                var sub = item.Value;
+            var affectedCodes = targets
+                .Where(x => x.Value != null && !string.IsNullOrWhiteSpace(x.Value.Code))
+                .Select(x => x.Value.Code.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-                _api?.SetRealRemove(sub.ScreenNo, sub.Code);
+            // 먼저 이 창 소비자만 제거한다.
+            // 실제 SetRealRemove는 해당 종목의 일반 창/HOLDING 소비자가 모두 사라졌을 때만 실행한다.
+            foreach (var item in targets)
                 _windowSubscriptions.TryRemove(item.Key, out _);
 
-                bool stillUsed = _windowSubscriptions.Values.Any(x => x.Code == sub.Code);
-
-                if (!stillUsed)
-                {
-                    _inventoryRegistered.TryRemove(sub.Code, out _);
-                    ReleaseSymbolToken(sub.Code);
-                }
-            }
+            foreach (string code in affectedCodes)
+                ReleaseUnifiedSymbolRealtimeIfUnused(code, "UnregisterWindow/ConsumerDetached");
 
             _scheduler?.UnregisterWindow(windowId);
 
-            OnLog?.Invoke(windowId, $"[실시간 해제] 창 종료 정리 완료: {windowId}");
+            OnLog?.Invoke(
+                windowId,
+                $"[실시간 해제] 창 소비자 정리 완료: {windowId} / affectedCodes={affectedCodes.Count}");
         }
+
+
 
         private double SafeSignedDouble(string value)
         {

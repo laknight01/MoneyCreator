@@ -12,6 +12,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 
 namespace MoneyCreator.View
 {
@@ -25,12 +26,55 @@ namespace MoneyCreator.View
 
         public PopBox() => InitializeComponent();
 
-        public static async Task<bool> Show(Window owner, PopUpType type, string message)
+        public static Task<bool> Show(Window owner, PopUpType type, string message)
         {
-            if (owner == null) return false;
+            if (owner == null)
+                return Task.FromResult(false);
+
+            var dispatcher = owner.Dispatcher ?? Application.Current?.Dispatcher;
+            if (dispatcher == null ||
+                dispatcher.HasShutdownStarted ||
+                dispatcher.HasShutdownFinished)
+                return Task.FromResult(false);
+
+            if (dispatcher.CheckAccess())
+                return ShowOnUiThreadAsync(owner, type, message);
+
+            var tcs = new TaskCompletionSource<bool>();
+
+            try
+            {
+                dispatcher.BeginInvoke(
+                    DispatcherPriority.Normal,
+                    new Action(async () =>
+                    {
+                        try
+                        {
+                            bool result = await ShowOnUiThreadAsync(owner, type, message);
+                            tcs.TrySetResult(result);
+                        }
+                        catch
+                        {
+                            tcs.TrySetResult(false);
+                        }
+                    }));
+            }
+            catch
+            {
+                tcs.TrySetResult(false);
+            }
+
+            return tcs.Task;
+        }
+
+        private static async Task<bool> ShowOnUiThreadAsync(Window owner, PopUpType type, string message)
+        {
+            if (owner == null)
+                return false;
 
             var container = owner.FindName("MainGrid") as Grid;
-            if (container == null) return false;
+            if (container == null)
+                return false;
 
             var popup = new PopBox
             {
@@ -38,19 +82,23 @@ namespace MoneyCreator.View
             };
 
             popup.SetupType(type);
+            popup._tcs = new TaskCompletionSource<bool>();
 
             container.Children.Add(popup);
             Grid.SetRowSpan(popup, 99);
 
-            popup._tcs = new TaskCompletionSource<bool>();
-
             if (type == PopUpType.Alert)
                 popup.StartAutoCloseTimer();
 
-            bool result = await popup._tcs.Task;
-            container.Children.Remove(popup);
-
-            return result;
+            try
+            {
+                return await popup._tcs.Task;
+            }
+            finally
+            {
+                if (container.Children.Contains(popup))
+                    container.Children.Remove(popup);
+            }
         }
 
         private void SetupType(PopUpType type)

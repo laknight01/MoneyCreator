@@ -126,7 +126,7 @@
         <Grid Grid.Row="1" Background="#1E1E1E" Margin="0,0,0,1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="210"/>
-                <ColumnDefinition Width="420"/>
+                <ColumnDefinition Width="320"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
@@ -220,11 +220,11 @@
                     </Border>
                 </Popup>
 
-                <Button Content="관심 추가"
+                <!--<Button Content="관심 추가"
                         Command="{Binding AddWatchlistCommand}"
                         Width="80"
                         Height="30"
-                        Margin="5"/>
+                        Margin="5"/>-->
             </StackPanel>
             <StackPanel Grid.Column="2"
                         Orientation="Horizontal"
@@ -255,15 +255,15 @@
                            FontWeight="Bold"
                            Width="120"
                            VerticalAlignment="Center"
-                           Margin="0,0,8,0"/>
+                           Margin="0,0,0,0"/>
 
                 <TextBlock Text="{Binding CurrentSymbolAllocationText}"
                            Foreground="#FFD966"
                            FontSize="12"
                            FontWeight="SemiBold"
-                           Width="190"
+                           Width="280"
                            VerticalAlignment="Center"
-                           Margin="0,0,20,0"/>
+                           Margin="0,0,40,0"/>
 
                 <Button Content="연결"
                         Command="{Binding ConnectCommand}"
@@ -282,12 +282,12 @@
                         Command="{Binding AiToggleCommand}"
                         Width="90"
                         Height="30"
-                        Margin="0,0,122,0"
+                        Margin="0,0,50,0"
                         ToolTip="종목이 지정되지 않은 새 창을 하나 더 띄웁니다"/>
                 <StackPanel Orientation="Horizontal"
                             VerticalAlignment="Center"
                             Margin="0,0,12,0">
-                    <TextBlock Text="자동매매"
+                    <TextBlock Text="Auto"
                                Foreground="White"
                                VerticalAlignment="Center"
                                Margin="0,0,6,0"/>
@@ -297,14 +297,27 @@
                 </StackPanel>
 
                 <StackPanel Orientation="Horizontal"
-                            VerticalAlignment="Center">
-                    <TextBlock Text="SmallScale"
+                            VerticalAlignment="Center"
+                            Margin="0,0,12,0">
+                    <TextBlock Text="Small"
                                Foreground="White"
                                VerticalAlignment="Center"
                                Margin="0,0,6,0"/>
 
                     <ToggleButton Style="{StaticResource SwitchToggleStyle}"
                                   IsChecked="{Binding IsAutoTradingSmallScale, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <TextBlock Text="Replay"
+                               Foreground="#9FE6FF"
+                               VerticalAlignment="Center"
+                               Margin="0,0,6,0"/>
+
+                    <ToggleButton Style="{StaticResource SwitchToggleStyle}"
+                                  IsChecked="{Binding IsReplayMode, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  ToolTip="ReplayData_yyyyMMdd.db 데이터를 LocalReplayApiService로 실시간처럼 주입합니다."/>
                 </StackPanel>
 
                 <!--<StackPanel Orientation="Horizontal"
@@ -442,11 +455,11 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                             <!-- 시장상태 -->
                             <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
-                            <RowDefinition Height="80"/>
+                            <RowDefinition Height="60"/>
                         </Grid.RowDefinitions>
 
                         <DockPanel Grid.Row="0" LastChildFill="False">
@@ -486,30 +499,30 @@
                                        FontSize="15"
                                        FontWeight="SemiBold"/>
                         </StackPanel>
-                        <Grid Grid.Row="3" Margin="0,14,0,0">
+                        <Grid Grid.Row="3" Margin="0,5,0,0">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
-                            <StackPanel Grid.Column="0" Margin="0,8,0,0">
+                            <StackPanel Grid.Column="0" Margin="0,5,0,0">
                                 <TextBlock Text="시장상태" Foreground="#CDE7FF" FontSize="11" Opacity="0.85"/>
                                 <TextBlock Text="{Binding TradeCardPhase}" Foreground="#FFD966" FontSize="14" FontWeight="Bold"/>
                             </StackPanel>
-                            <StackPanel Grid.Column="1" Margin="0,8,0,0">
+                            <StackPanel Grid.Column="1" Margin="0,5,0,0">
                                 <TextBlock Text="종목국면" Foreground="#CDE7FF" FontSize="11" Opacity="0.85"/>
                                 <TextBlock Text="{Binding TradeCardMarketPhase}" Foreground="#FFD966" FontSize="14" FontWeight="Bold"/>
                             </StackPanel>
                         </Grid>
-                        <Grid Grid.Row="4" Margin="0,14,0,0">
+                        <Grid Grid.Row="4" Margin="0,5,0,0">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
                             <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="40"/>
+                                <RowDefinition Height="40"/>
+                                <RowDefinition Height="40"/>
+                                <RowDefinition Height="40"/>
                             </Grid.RowDefinitions>
 
                             <StackPanel Grid.Row="0" Grid.Column="0" Margin="0,0,8,8">
@@ -552,11 +565,11 @@
                         <Grid Grid.Row="5" Margin="0,0,0,0">
                             <StackPanel>
                                 <StackPanel Grid.Row="3" Grid.Column="0" Margin="0,0,8,0">
-                                    <TextBlock Text="1분 / 3분" Foreground="#CDE7FF" FontSize="11" Opacity="0.85"/>
+                                    <TextBlock Text="가격변화율 / BAR 충전율" Foreground="#CDE7FF" FontSize="11" Opacity="0.85"/>
                                     <TextBlock Foreground="White" FontSize="13">
-                                         <Run Text="{Binding TradeCardOneMinuteChange}"/>
-                                         <Run Text=" / "/>
-                                         <Run Text="{Binding TradeCardThreeMinuteChange}"/>
+                           <Run Text="{Binding TradeCardOneMinuteChange}"/>
+                           <Run Text=" / "/>
+                           <Run Text="{Binding TradeCardThreeMinuteChange}"/>
                                     </TextBlock>
                                 </StackPanel>
                             </StackPanel>
@@ -569,13 +582,13 @@
                                            Opacity="0.85"/>
                                 <TextBlock Text="{Binding TradeCardReason}"
                                            Foreground="White"
-                                           FontSize="12"
+                                           FontSize="11"
                                            TextWrapping="Wrap"
                                            MaxHeight="154"/>
                             </StackPanel>
                         </Border>
 
-                        <Grid Grid.Row="7" Margin="0,8,0,0">
+                        <Grid Grid.Row="7" Margin="0,5,0,0">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
@@ -585,8 +598,7 @@
                                 <ColumnDefinition Width="Auto"></ColumnDefinition>
                             </Grid.ColumnDefinitions>
                             <StackPanel Grid.Row="0" Margin="0,4,0,4">
-                                <TextBlock Text="TiRex 예측" Foreground="#CDE7FF" FontSize="11" Opacity="0.85"/>
-                                <TextBlock Text="{Binding TiRexPredictionText}" Foreground="White" FontSize="12" FontWeight="SemiBold"/>
+                                <TextBlock Text="{Binding TiRexPredictionText}" Foreground="White" FontSize="11" FontWeight="SemiBold"/>
                                 <TextBlock Text="{Binding TiRexPredictionDetail}" Foreground="#9FD7FF" FontSize="10" Opacity="0.9"/>
                             </StackPanel>
                             <StackPanel Grid.Row="1" Grid.Column="0" HorizontalAlignment="Left">
@@ -602,22 +614,12 @@
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="*"/>
-                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="25"/>
+                            <RowDefinition Height="25"/>
                             <RowDefinition Height="*"/>
                         </Grid.RowDefinitions>
-
-                        <TextBlock Grid.Row="0"
-                   Text="시장지수"
-                   Foreground="#CDE7FF"
-                   FontSize="12"
-                   FontWeight="Bold"
-                   Margin="0,0,0,6"/>
-
-                        <Border Grid.Row="1"
-                BorderBrush="#2E2E2E"
-                BorderThickness="0,0,0,1"
-                Padding="0,3,0,6">
+                        <TextBlock Grid.Row="0" Text="시장지수" Foreground="#CDE7FF" FontSize="12" FontWeight="Bold" Margin="0,0,0,6"/>
+                        <Border Grid.Row="1" BorderBrush="#2E2E2E" BorderThickness="0,0,0,1" Padding="0,3,0,6">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="70"/>
@@ -630,8 +632,7 @@
                             </Grid>
                         </Border>
 
-                        <Border Grid.Row="2"
-                Padding="0,6,0,0">
+                        <Border Grid.Row="2" Padding="0,6,0,0">
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="60"/>
@@ -657,7 +658,7 @@
             <Grid Grid.Column="2" Margin="5,0,0,0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*"/>
-                    <RowDefinition Height="250"/>
+                    <RowDefinition Height="215"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <Border Grid.Row="0" Grid.RowSpan="2" Grid.Column="0" BorderBrush="#333" BorderThickness="1" Margin="2">
@@ -665,7 +666,7 @@
                         <ItemsControl ItemsSource="{Binding AskList}" HorizontalAlignment="Center" VerticalAlignment="Center">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                    <Grid Height="26" Margin="0,0.5">
+                                    <Grid Height="22" Margin="0,0.5">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="75"/>
                                             <ColumnDefinition Width="150"/>
@@ -718,7 +719,7 @@
                         <ItemsControl ItemsSource="{Binding BidList}" HorizontalAlignment="Center" VerticalAlignment="Center">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                    <Grid Height="26" Margin="0,0.5">
+                                    <Grid Height="22" Margin="0,0.5">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="75"/>
                                             <ColumnDefinition Width="150"/>
@@ -785,7 +786,7 @@
                                     <TextBlock Text="주문가능" Foreground="#888" VerticalAlignment="Center" Margin="0,0,10,0"/>
                                     <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
                                         <TextBlock Text="{Binding CurrentBalance, StringFormat={}{0:N0}원}" Foreground="White" HorizontalAlignment="Right"/>
-                                        <TextBlock Text="{Binding CurrentSymbolAllocationText}" Foreground="#FFD966" HorizontalAlignment="Right" Margin="10,0,0,0"/>
+                                        <!--<TextBlock Text="{Binding CurrentSymbolAllocationText}" Foreground="#FFD966" HorizontalAlignment="Right" Margin="10,0,0,0"/>-->
                                         <Button Content="현재가" Width="60" Command="{Binding SetCurrentPriceCommand}" FontSize="11" HorizontalAlignment="Right" Padding="5,1" Margin="10,0,0,0" Background="#3D3D3D" Foreground="#DDD"/>
                                     </StackPanel>
                                 </DockPanel>
@@ -872,14 +873,14 @@
             </Grid>
             <Grid Grid.Column="1" Margin="5,0,0,0">
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="250"/>
-                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="383"/>
+                    <RowDefinition Height="120"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
-                <Border Grid.Row="0" Grid.RowSpan="2" Grid.Column="0" BorderBrush="#333" BorderThickness="1" Margin="2">
+                <Border Grid.Row="0" Grid.Column="0" BorderBrush="#333" BorderThickness="1" Margin="2">
                     <Grid Grid.Column="0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="*"/>
@@ -896,17 +897,53 @@
                                     </StackPanel>
                                 </Grid>
                                 <Canvas x:Name="OverlayCanvas" IsHitTestVisible="False">
-
                                     <TextBlock x:Name="PriceLabel"
-           Text="가격: 0 | 거래량: 0"
-           Foreground="#CCCCCC"
-           FontSize="14"
-           FontWeight="Bold"
-           Background="#AA000000"
-           Padding="4"
-           Visibility="Collapsed"/>
+                                       Text="가격: 0 | 거래량: 0"
+                                       Foreground="#CCCCCC"
+                                       FontSize="14"
+                                       FontWeight="Bold"
+                                       Background="#AA000000"
+                                       Padding="4"
+                                       Visibility="Collapsed"/>
 
                                 </Canvas>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </Border>
+                <Border Grid.Row="1" Grid.Column="0" BorderBrush="#333" BorderThickness="1" Margin="2">
+                    <Grid Grid.Column="0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" Grid.Column="0" BorderBrush="#333" BorderThickness="1" Margin="2">
+                            <Grid>
+                                <ScottPlot:WpfPlot x:Name="MyPlotScore" Background="Gray" />
+
+                                <!-- .NET Framework 4.8 호환 점수 차트 마우스 오버 표시 -->
+                                <Canvas IsHitTestVisible="False">
+                                    <Border x:Name="ScoreHoverBorder"
+                                            Background="#DD000000"
+                                            BorderBrush="#666666"
+                                            BorderThickness="1"
+                                            Padding="6,4"
+                                            Visibility="Collapsed">
+                                        <TextBlock x:Name="ScoreLabel"
+                                                   Text="시간: --:--:-- | 점수: 0"
+                                                   Foreground="#FFD966"
+                                                   FontSize="14"
+                                                   FontWeight="Bold"/>
+                                    </Border>
+                                </Canvas>
+
+                                <Grid Background="#AA111111" 
+   Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}">
+
+                                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                                        <ProgressBar IsIndeterminate="True" Width="400" Height="15" Foreground="#FF007ACC" Background="#33FFFFFF" BorderThickness="0"/>
+                                        <TextBlock Text="데이터를 불러오는 중입니다..." Foreground="White" HorizontalAlignment="Center" Margin="0,20,0,0" FontSize="18" Opacity="0.9"/>
+                                    </StackPanel>
+                                </Grid>
                             </Grid>
                         </Border>
                     </Grid>
@@ -963,19 +1000,32 @@
                                         </StackPanel>
                                     </DockPanel>
                                 </Border>
-
-                                <ListBox Grid.Row="1"
-                                         ItemsSource="{Binding AutoTradeAnalysisLogs}"
-                                         Background="#0F0F0F"
-                                         Foreground="#D8D8D8"
-                                         BorderThickness="0"
-                                         FontFamily="Consolas"
-                                         FontSize="12"
-                                         ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                         ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                                <ListBox x:Name="AutoTradeAnalysisLogListBox"
+                                             Grid.Row="1"
+                                             ItemsSource="{Binding AutoTradeAnalysisLogs}"
+                                             Background="#0F0F0F"
+                                             Foreground="#D8D8D8"
+                                             BorderThickness="0"
+                                             FontFamily="Consolas"
+                                             FontSize="12"
+                                             SelectionMode="Extended"
+                                             Focusable="True"
+                                             PreviewKeyDown="AutoTradeAnalysisLogListBox_PreviewKeyDown"
+                                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                             ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="{x:Type ListBoxItem}">
+                                            <Setter Property="Focusable" Value="True"/>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
                                     <ListBox.ItemTemplate>
                                         <DataTemplate>
-                                            <TextBlock Text="{Binding}" TextWrapping="NoWrap" Margin="4,1"/>
+                                            <TextBlock Text="{Binding Mode=OneWay}"
+                                                       Foreground="#D8D8D8"
+                                                       FontFamily="Consolas"
+                                                       FontSize="12"
+                                                       TextWrapping="NoWrap"
+                                                       Margin="4,1"/>
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
@@ -1145,7 +1195,158 @@
                                 <!-- 3. 프로그램매매 탭 -->
                                 <TabItem Header="프로그램매매" Width="100">
                                     <Grid Background="#1A1A1A">
-                                        <TextBlock Text="AI 자동매매 로그 및 상태 표시 영역" Foreground="Gray" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="25"/>
+                                            <RowDefinition Height="*"/>
+                                        </Grid.RowDefinitions>
+
+                                        <Border Grid.Row="0"
+                                                Background="#202020"
+                                                BorderBrush="#333333"
+                                                BorderThickness="0,0,0,1"
+                                                Padding="8,4">
+                                            <DockPanel LastChildFill="True">
+                                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                    <TextBlock Text="상태 " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.FlowDirection, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontWeight="Bold"
+                                                               FontSize="11"
+                                                               Margin="0,0,12,0"/>
+
+                                                    <TextBlock Text="점수 " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.FlowScore, StringFormat={}{0:N1}, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontSize="11"
+                                                               Margin="0,0,12,0"/>
+
+                                                    <TextBlock Text="Δ1m " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.Delta1mAmount, StringFormat={}{0:+#,##0;-#,##0;0}, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontSize="11"
+                                                               Margin="0,0,12,0"/>
+
+                                                    <TextBlock Text="Δ5m " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.Delta5mAmount, StringFormat={}{0:+#,##0;-#,##0;0}, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontSize="11"
+                                                               Margin="0,0,12,0"/>
+
+                                                    <TextBlock Text="Δ10m " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.Delta10mAmount, StringFormat={}{0:+#,##0;-#,##0;0}, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontSize="11"
+                                                               Margin="0,0,12,0"/>
+
+                                                    <TextBlock Text="WarmUp " Foreground="#888888" FontSize="11"/>
+                                                    <TextBlock Text="{Binding LatestProgramFlowSnapshot.IsWarmedUp, TargetNullValue=-}"
+                                                               Foreground="#EEEEEE"
+                                                               FontSize="11"/>
+                                                </StackPanel>
+                                            </DockPanel>
+                                        </Border>
+
+                                        <DataGrid Grid.Row="1"
+                                                  ItemsSource="{Binding ProgramTrades}"
+                                                  AutoGenerateColumns="False"
+                                                  IsReadOnly="True"
+                                                  EnableRowVirtualization="True"
+                                                  EnableColumnVirtualization="True"
+                                                  VirtualizingPanel.IsVirtualizing="True"
+                                                  VirtualizingPanel.VirtualizationMode="Recycling"
+                                                  Background="#1A1A1A"
+                                                  Foreground="#EEEEEE"
+                                                  BorderThickness="0"
+                                                  GridLinesVisibility="Horizontal"
+                                                  HorizontalGridLinesBrush="#333333"
+                                                  RowBackground="#1A1A1A"
+                                                  AlternatingRowBackground="#222222"
+                                                  HeadersVisibility="Column"
+                                                  CanUserAddRows="False"
+                                                  CanUserDeleteRows="False"
+                                                  CanUserReorderColumns="False"
+                                                  CanUserResizeRows="False">
+                                            <DataGrid.Resources>
+                                                <Style TargetType="DataGridColumnHeader">
+                                                    <Setter Property="Background" Value="#2A2A2A"/>
+                                                    <Setter Property="Foreground" Value="#DDDDDD"/>
+                                                    <Setter Property="FontWeight" Value="Bold"/>
+                                                    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                                                    <Setter Property="BorderBrush" Value="#444444"/>
+                                                    <Setter Property="BorderThickness" Value="0,0,1,1"/>
+                                                </Style>
+                                                <Style TargetType="DataGridCell">
+                                                    <Setter Property="Background" Value="Transparent"/>
+                                                    <Setter Property="Foreground" Value="#EEEEEE"/>
+                                                    <Setter Property="BorderBrush" Value="#333333"/>
+                                                    <Setter Property="BorderThickness" Value="0,0,1,0"/>
+                                                    <Setter Property="Padding" Value="4,1"/>
+                                                </Style>
+                                                <Style x:Key="ProgramTradeRightTextStyle" TargetType="TextBlock">
+                                                    <Setter Property="HorizontalAlignment" Value="Right"/>
+                                                    <Setter Property="VerticalAlignment" Value="Center"/>
+                                                    <Setter Property="Margin" Value="0,0,4,0"/>
+                                                </Style>
+                                                <Style x:Key="ProgramTradeCenterTextStyle" TargetType="TextBlock">
+                                                    <Setter Property="HorizontalAlignment" Value="Center"/>
+                                                    <Setter Property="VerticalAlignment" Value="Center"/>
+                                                </Style>
+                                            </DataGrid.Resources>
+                                            <DataGrid.Columns>
+                                                <DataGridTextColumn Header="시간"
+                                                                    Binding="{Binding TradeTime, StringFormat={}{0:HH:mm:ss}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeCenterTextStyle}"
+                                                                    Width="80"/>
+                                                <DataGridTextColumn Header="소스"
+                                                                    Binding="{Binding Source}"
+                                                                    ElementStyle="{StaticResource ProgramTradeCenterTextStyle}"
+                                                                    Width="75"/>
+                                                <DataGridTextColumn Header="방향"
+                                                                    Binding="{Binding Direction}"
+                                                                    ElementStyle="{StaticResource ProgramTradeCenterTextStyle}"
+                                                                    Width="70"/>
+                                                <DataGridTextColumn Header="현재가"
+                                                                    Binding="{Binding CurrentPrice, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="90"/>
+                                                <DataGridTextColumn Header="순매수금액"
+                                                                    Binding="{Binding DisplayNetAmount, StringFormat={}{0:+#,##0;-#,##0;0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="120"/>
+                                                <DataGridTextColumn Header="Δ금액"
+                                                                    Binding="{Binding DisplayNetAmountDelta, StringFormat={}{0:+#,##0;-#,##0;0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="100"/>
+                                                <DataGridTextColumn Header="매수금액"
+                                                                    Binding="{Binding ProgramBuyAmount, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="110"/>
+                                                <DataGridTextColumn Header="매도금액"
+                                                                    Binding="{Binding ProgramSellAmount, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="110"/>
+                                                <DataGridTextColumn Header="순매수수량"
+                                                                    Binding="{Binding DisplayNetQuantity, StringFormat={}{0:+#,##0;-#,##0;0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="100"/>
+                                                <DataGridTextColumn Header="Δ수량"
+                                                                    Binding="{Binding DisplayNetQuantityDelta, StringFormat={}{0:+#,##0;-#,##0;0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="90"/>
+                                                <DataGridTextColumn Header="매수수량"
+                                                                    Binding="{Binding ProgramBuyQuantity, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="95"/>
+                                                <DataGridTextColumn Header="매도수량"
+                                                                    Binding="{Binding ProgramSellQuantity, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="95"/>
+                                                <DataGridTextColumn Header="거래량"
+                                                                    Binding="{Binding Volume, StringFormat={}{0:N0}}"
+                                                                    ElementStyle="{StaticResource ProgramTradeRightTextStyle}"
+                                                                    Width="90"/>
+                                            </DataGrid.Columns>
+                                        </DataGrid>
                                     </Grid>
                                 </TabItem>
                             </TabControl>
@@ -1155,7 +1356,17 @@
             </Grid>
         </Grid>
         <Border Grid.Row="3" Background="#0A0A0A" BorderBrush="#333" BorderThickness="0,1,0,0" Padding="5">
-            <ListBox ItemsSource="{Binding Logs}" VirtualizingStackPanel.IsVirtualizing="True" VirtualizingStackPanel.VirtualizationMode="Recycling" Background="Transparent" Foreground="#00FF00" FontFamily="Consolas" BorderThickness="0">
+            <ListBox x:Name="MainLogListBox"
+                     ItemsSource="{Binding Logs}"
+                     SelectionMode="Extended"
+                     Focusable="True"
+                     PreviewKeyDown="MainLogListBox_PreviewKeyDown"
+                     VirtualizingStackPanel.IsVirtualizing="True"
+                     VirtualizingStackPanel.VirtualizationMode="Recycling"
+                     Background="Transparent"
+                     Foreground="#00FF00"
+                     FontFamily="Consolas"
+                     BorderThickness="0">
             </ListBox>
         </Border>
         <Border Grid.RowSpan="4"

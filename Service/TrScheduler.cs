@@ -23,13 +23,23 @@ namespace MoneyCreator.Service
     public class TrScheduler
     {
         private readonly Func<int> _getActiveTrCount;
-        private string GetTokenKey(string windowId, string code) => $"{windowId}_{code}";
+        private string GetTokenKey(string windowId, string code, string requestType) => $"{windowId}_{code}_{requestType}";
         private string GetResponseKey(string windowId, string code, string requestType) => $"{windowId}_{code}_{requestType}";
+        private bool IsCycleRequestType(string requestType)
+        {
+            return requestType == "PREV" ||
+                   requestType == "MINUTE" ||
+                   requestType == "RECENT_TICKS" ||
+                   requestType == "ORDERS" ||
+                   requestType == "PROGRAM_TRADE";
+        }
 
+        private readonly ConcurrentQueue<TrRequest> _continuationQueue = new ConcurrentQueue<TrRequest>();
         private readonly ConcurrentQueue<TrRequest> _highQueue = new ConcurrentQueue<TrRequest>();
         private readonly ConcurrentQueue<TrRequest> _mediumQueue = new ConcurrentQueue<TrRequest>();
         private readonly ConcurrentQueue<TrRequest> _lowQueue = new ConcurrentQueue<TrRequest>();
         private readonly ConcurrentDictionary<string, int> _latestToken = new ConcurrentDictionary<string, int>();
+        private readonly ConcurrentDictionary<string, int> _activeCycleToken = new ConcurrentDictionary<string, int>();
 
         private readonly ConcurrentDictionary<string, byte> _activeWindows = new ConcurrentDictionary<string, byte>();
 
@@ -69,6 +79,13 @@ namespace MoneyCreator.Service
                 if (key.StartsWith(prefix, StringComparison.Ordinal))
                     _latestToken.TryRemove(key, out _);
             }
+
+            foreach (var key in _activeCycleToken.Keys.ToList())
+            {
+                int removed;
+                if (key.StartsWith(prefix, StringComparison.Ordinal))
+                    _activeCycleToken.TryRemove(key, out removed);
+            }
         }
 
         public void Enqueue(TrRequest req)
@@ -77,18 +94,38 @@ namespace MoneyCreator.Service
                 return;
 
             RegisterWindow(req.WindowId);
-            string tokenKey = GetTokenKey(req.WindowId, req.Code);
+            string tokenKey = GetTokenKey(req.WindowId, req.Code, req.RequestType);
 
             lock (_lock)
             {
-                if (req.Next != 2 || !_latestToken.ContainsKey(tokenKey))
-                    _latestToken[tokenKey] = Interlocked.Increment(ref _tokenSeed);
+                if (req.Next == 2)
+                {
+                    int token;
+                    if (_activeCycleToken.TryGetValue(tokenKey, out token))
+                    {
+                        req.Token = token;
+                    }
+                    else if (_latestToken.TryGetValue(tokenKey, out token))
+                    {
+                        req.Token = token;
+                    }
+                    else
+                    {
+                        req.Token = Interlocked.Increment(ref _tokenSeed);
+                        _latestToken[tokenKey] = req.Token;
+                    }
 
-                req.Token = _latestToken[tokenKey];
+                    _continuationQueue.Enqueue(req);
+                }
+                else
+                {
+                    req.Token = Interlocked.Increment(ref _tokenSeed);
+                    _latestToken[tokenKey] = req.Token;
 
-                if (req.Priority == 0) _highQueue.Enqueue(req);
-                else if (req.Priority == 1) _mediumQueue.Enqueue(req);
-                else _lowQueue.Enqueue(req);
+                    if (req.Priority == 0) _highQueue.Enqueue(req);
+                    else if (req.Priority == 1) _mediumQueue.Enqueue(req);
+                    else _lowQueue.Enqueue(req);
+                }
 
                 if (!_isProcessing)
                 {
@@ -107,6 +144,7 @@ namespace MoneyCreator.Service
                     req.RequestType == "RECENT_TICKS" ||
                     req.RequestType == "PREV" ||
                     req.RequestType == "ORDERS" ||
+                    req.RequestType == "PROGRAM_TRADE" ||
                     req.RequestType == "HOLDINGS" ||
                     req.RequestType == "CASH" ||
                     req.RequestType == "UNFILLED");
@@ -167,7 +205,7 @@ namespace MoneyCreator.Service
 
             // 키움 응답 이벤트가 누락되었을 때 스케줄러가 영구 정지하지 않도록 안전장치.
             // 정상 상황에서는 OnReceiveTrData 처리 완료 후 즉시 풀린다.
-            Task completed = await Task.WhenAny(waitTask, Task.Delay(500));
+            Task completed = await Task.WhenAny(waitTask, Task.Delay(10000));
             return completed == waitTask && waitTask.Result;
         }
 
@@ -181,9 +219,12 @@ namespace MoneyCreator.Service
                 {
                     bool didWork = false;
 
-                    // high / medium / low 큐 구조는 유지한다.
-                    // 단, 한 번에 하나의 TR만 실행한다.
-                    didWork |= await ProcessBatch(_highQueue, 1);
+                    // next=2 연속조회는 현재 히스토리 사이클 내부 후속 페이지다.
+                    // 일반 high/medium/low 큐보다 반드시 먼저 처리해서 사이클 중간에 다른 TR이 끼지 않게 한다.
+                    didWork |= await ProcessBatch(_continuationQueue, 1);
+
+                    if (!didWork)
+                        didWork |= await ProcessBatch(_highQueue, 1);
 
                     if (!didWork)
                         didWork |= await ProcessBatch(_mediumQueue, 1);
@@ -197,7 +238,8 @@ namespace MoneyCreator.Service
 
                         if (++emptyCount > 20)
                         {
-                            if (_highQueue.IsEmpty &&
+                            if (_continuationQueue.IsEmpty &&
+                                _highQueue.IsEmpty &&
                                 _mediumQueue.IsEmpty &&
                                 _lowQueue.IsEmpty &&
                                 _getActiveTrCount() == 0)
@@ -219,13 +261,55 @@ namespace MoneyCreator.Service
                     _isProcessing = false;
 
                     // finally와 Enqueue 사이의 아주 짧은 타이밍에 새 요청이 들어온 경우 다시 루프를 켠다.
-                    if (!_highQueue.IsEmpty || !_mediumQueue.IsEmpty || !_lowQueue.IsEmpty)
+                    if (!_continuationQueue.IsEmpty || !_highQueue.IsEmpty || !_mediumQueue.IsEmpty || !_lowQueue.IsEmpty)
                     {
                         _isProcessing = true;
                         Task.Run(RunQueueLoop);
                     }
                 }
             }
+        }
+
+        private string GetCycleKey(TrRequest req)
+        {
+            if (req == null)
+                return string.Empty;
+
+            return GetTokenKey(req.WindowId, req.Code, req.RequestType);
+        }
+
+        private void BeginCycleIfNeeded(TrRequest req)
+        {
+            if (req == null || !IsCycleRequestType(req.RequestType))
+                return;
+
+            string key = GetCycleKey(req);
+            if (string.IsNullOrWhiteSpace(key))
+                return;
+
+            _activeCycleToken[key] = req.Token;
+        }
+
+        private void EndCycleIfNoContinuation(TrRequest req)
+        {
+            if (req == null || !IsCycleRequestType(req.RequestType))
+                return;
+
+            string key = GetCycleKey(req);
+            if (string.IsNullOrWhiteSpace(key))
+                return;
+
+            foreach (var next in _continuationQueue.ToArray())
+            {
+                if (next == null)
+                    continue;
+
+                if (next.Token == req.Token && GetCycleKey(next) == key)
+                    return;
+            }
+
+            int removed;
+            _activeCycleToken.TryRemove(key, out removed);
         }
 
         private async Task<bool> ProcessBatch(ConcurrentQueue<TrRequest> queue, int weight)
@@ -240,6 +324,8 @@ namespace MoneyCreator.Service
 
                 if (!IsValid(req))
                     continue;
+
+                BeginCycleIfNeeded(req);
 
                 bool waitResponse = RequiresResponseWait(req);
                 Task<bool> responseWaitTask = null;
@@ -272,11 +358,13 @@ namespace MoneyCreator.Service
                     if (waitResponse)
                         ClearResponseWait(req);
 
+                    EndCycleIfNoContinuation(req);
+
                     _trSemaphore.Release();
                 }
 
                 processedAny = true;
-                Debug.WriteLine($"ENQUEUE {req.Inputs} {req.Code} {req.WindowId}");
+                //Debug.WriteLine($"ENQUEUE {req.Inputs} {req.Code} {req.WindowId}");
             }
 
             return processedAny;
@@ -302,6 +390,9 @@ namespace MoneyCreator.Service
                 req.RequestType == "PREV")
                 return req.Next == 2 ? 300 : 500;
 
+            if (req.RequestType == "PROGRAM_TRADE")
+                return req.Next == 2 ? 500 : 800;
+
             return 500;
         }
 
@@ -310,13 +401,15 @@ namespace MoneyCreator.Service
             if (req == null)
                 return false;
 
-            if (req.RequestType == "PREV" ||
-                req.RequestType == "MINUTE" ||
-                req.RequestType == "RECENT_TICKS" ||
-                req.RequestType == "ORDERS")
+            if (IsCycleRequestType(req.RequestType))
             {
-                string tokenKey = GetTokenKey(req.WindowId, req.Code);
-                return _latestToken.TryGetValue(tokenKey, out var t) && t == req.Token;
+                string tokenKey = GetTokenKey(req.WindowId, req.Code, req.RequestType);
+                int activeToken;
+                if (_activeCycleToken.TryGetValue(tokenKey, out activeToken) && activeToken == req.Token)
+                    return true;
+
+                int latestToken;
+                return _latestToken.TryGetValue(tokenKey, out latestToken) && latestToken == req.Token;
             }
 
             return true;

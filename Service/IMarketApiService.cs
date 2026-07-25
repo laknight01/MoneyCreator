@@ -19,6 +19,9 @@ namespace MoneyCreator.Service
         event Action<string, HogaData> OnHogaReceived;
         event Action<string, long> OnBalanceUpdated;
         event Action<string, List<HoldingInfo>> OnHoldingsReceived;
+        // code, name, absoluteQty, averagePrice
+        // Kiwoom balance Chejan(sGubun=1) based immediate position state.
+        event Action<string, string, int, double> OnPositionBalanceChanged;
         event Action<string, List<OrderInfo>> OnOrdersReceived;
         event Action<string, List<OrderInfo>> OnUnfilledOrdersReceived;
         event Action<string> OnGlobalUpdateRequired;
