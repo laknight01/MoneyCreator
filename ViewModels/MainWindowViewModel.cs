@@ -10,6 +10,7 @@ using AxKHOpenAPILib;
 using MoneyCreator.Biz;
 using MoneyCreator.Models;
 using MoneyCreator.Service;
+using MoneyCreator.Service.Replay;
 using MoneyCreator.View;
 using System;
 using System.Collections.Concurrent;
@@ -36,6 +37,29 @@ namespace MoneyCreator.ViewModels
         public List<TrackedSymbol> Candles { get; set; } = new List<TrackedSymbol>();
         public List<TradeMarkerInfo> Markers { get; set; } = new List<TradeMarkerInfo>();
         public bool IsFullRefresh { get; set; }
+    }
+
+    public sealed class ReplayTradingDateOption
+    {
+        public DateTime TradingDate { get; set; }
+        public bool HasRawTickDatabase { get; set; }
+        public bool IsLatestCompletedTradingDate { get; set; }
+        public bool CanUseKiwoomTickFallback { get; set; }
+        public long RawTickCount { get; set; }
+
+        public string DisplayText
+        {
+            get
+            {
+                string tickSource = HasRawTickDatabase
+                    ? "틱 DB"
+                    : CanUseKiwoomTickFallback
+                        ? "틱 키움"
+                        : "틱 없음";
+
+                return $"{TradingDate:yyyy-MM-dd}  {tickSource}";
+            }
+        }
     }
 
     public partial class MainWindowViewModel : ViewModelBase
@@ -67,6 +91,43 @@ namespace MoneyCreator.ViewModels
         public AutoTradingViewModel AutoTrading { get; private set; }
 
         private bool _isReplayMode;
+        private bool _suppressReplayTradingDateSelectionChanged;
+        private bool _isReplayTradingDateReloading;
+        private int _replayTradingDateRefreshVersion;
+        private DateTime _lastReadyReplayTradingDate = DateTime.MinValue;
+        private ReplayTradingDateOption _selectedReplayTradingDate;
+
+        public ObservableCollection<ReplayTradingDateOption> ReplayTradingDateOptions { get; } =
+            new ObservableCollection<ReplayTradingDateOption>();
+
+        public ReplayTradingDateOption SelectedReplayTradingDate
+        {
+            get => _selectedReplayTradingDate;
+            set
+            {
+                ReplayTradingDateOption previous = _selectedReplayTradingDate;
+                if (!SetProperty(ref _selectedReplayTradingDate, value))
+                    return;
+
+                OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+
+                if (!_suppressReplayTradingDateSelectionChanged &&
+                    IsReplayMode &&
+                    value != null &&
+                    Context != null &&
+                    !string.IsNullOrWhiteSpace(Context.Code))
+                {
+                    _ = ReloadReplayForSelectedDateAsync(value, previous);
+                }
+            }
+        }
+
+        public bool IsReplayDateSelectionEnabled =>
+            IsReplayMode &&
+            !_isReplayTradingDateReloading &&
+            !IsLoading &&
+            !IsMainLoading &&
+            ReplayTradingDateOptions.Count > 0;
 
         public ObservableCollection<string> Logs { get; } = new ObservableCollection<string>();
         // 자동매매/AI 분석 전용 로그
@@ -112,7 +173,11 @@ namespace MoneyCreator.ViewModels
         public bool IsMainLoading
         {
             get => _isMainLoading;
-            set => SetProperty(ref _isMainLoading, value);
+            set
+            {
+                if (SetProperty(ref _isMainLoading, value))
+                    OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+            }
         }
 
         public string MainLoadingMessage
@@ -273,7 +338,11 @@ namespace MoneyCreator.ViewModels
         public bool IsLoading
         {
             get => _isLoading;
-            set => SetProperty(ref _isLoading, value);
+            set
+            {
+                if (SetProperty(ref _isLoading, value))
+                    OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+            }
         }
         private bool IsMarketOpenForRealtime()
         {
@@ -1088,12 +1157,17 @@ namespace MoneyCreator.ViewModels
             ResetReplayAutoSessionLifecycleState("ReplayMode ON");
             OnPropertyChanged(nameof(IsReplayMode));
             OnPropertyChanged(nameof(ReplayModeStatusText));
+            OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
 
             ResetCurrentWindowForReplay("ReplayMode ON");
             ClearCurrentWindowAccountRuntimeState("ReplayMode ON");
 
             if (_marketApi is LocalReplayApiService replayApi)
                 replayApi.ResetReplaySession(WindowId);
+
+            _ = RefreshReplayTradingDateOptionsAsync(
+                Context == null ? string.Empty : Context.Code,
+                preserveCurrentSelection: true);
 
             AddLog("🧪 ReplayMode ON: Auto OFF / SmallScale ON / 현재 창을 초기화했습니다. 종목 선택 후 Auto ON 시 Replay Tick을 재생합니다.");
         }
@@ -1124,6 +1198,20 @@ namespace MoneyCreator.ViewModels
             SyncAutoTradeReplayModeSetting("ReplayMode OFF");
             OnPropertyChanged(nameof(IsReplayMode));
             OnPropertyChanged(nameof(ReplayModeStatusText));
+
+            Interlocked.Increment(ref _replayTradingDateRefreshVersion);
+            _suppressReplayTradingDateSelectionChanged = true;
+            try
+            {
+                ReplayTradingDateOptions.Clear();
+                SelectedReplayTradingDate = null;
+                _lastReadyReplayTradingDate = DateTime.MinValue;
+            }
+            finally
+            {
+                _suppressReplayTradingDateSelectionChanged = false;
+            }
+            OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
 
             if (_liveMarketApiBeforeReplay != null)
             {
@@ -1203,7 +1291,250 @@ namespace MoneyCreator.ViewModels
             AddLog($"🧹 현재 창/자동매매/차트 초기화 완료: {reason}");
         }
 
-        private async Task<bool> PrepareReplayDataForCurrentSymbolAsync(string code)
+        private static DateTime ResolvePreviousBusinessDayForReplay(DateTime date)
+        {
+            DateTime previous = date.Date.AddDays(-1);
+            while (previous.DayOfWeek == DayOfWeek.Saturday ||
+                   previous.DayOfWeek == DayOfWeek.Sunday)
+            {
+                previous = previous.AddDays(-1);
+            }
+
+            return previous.Date;
+        }
+
+        private DateTime ResolveDefaultReplayTradingDate()
+        {
+            return ReplayDataPrepareService.ResolveReplayTradingDate(
+                DateTime.Now,
+                DateTime.MinValue);
+        }
+
+        private async Task RefreshReplayTradingDateOptionsAsync(
+            string code,
+            bool preserveCurrentSelection)
+        {
+            if (!IsReplayMode)
+                return;
+
+            int refreshVersion = Interlocked.Increment(ref _replayTradingDateRefreshVersion);
+            string requestedCode = (code ?? string.Empty).Trim();
+            DateTime latestCompletedDate = ResolveDefaultReplayTradingDate();
+            DateTime previousBusinessDate = ResolvePreviousBusinessDayForReplay(DateTime.Now.Date);
+            DateTime preferredDate = preserveCurrentSelection && SelectedReplayTradingDate != null
+                ? SelectedReplayTradingDate.TradingDate.Date
+                : latestCompletedDate;
+
+            List<StockDbManager.ReplayRawTickCoverage> availableDbDates =
+                await Task.Run(() =>
+                {
+                    StockDbManager db = Db;
+                    return db == null
+                        ? new List<StockDbManager.ReplayRawTickCoverage>()
+                        : db.GetReplayAvailableRawTickDates(code, latestCompletedDate, 10);
+                }).ConfigureAwait(true);
+
+            if (!IsReplayMode || refreshVersion != Volatile.Read(ref _replayTradingDateRefreshVersion))
+                return;
+
+            string currentCode = Context == null ? string.Empty : (Context.Code ?? string.Empty).Trim();
+            if (!string.Equals(requestedCode, currentCode, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var options = new List<ReplayTradingDateOption>();
+            StockDbManager.ReplayRawTickCoverage latestCoverage = availableDbDates
+                .FirstOrDefault(x => x != null && x.TradingDate.Date == latestCompletedDate.Date);
+
+            // 최신 완료 거래일은 Raw DB가 없어도 키움 Tick 대체가 가능하므로 항상 표시한다.
+            options.Add(new ReplayTradingDateOption
+            {
+                TradingDate = latestCompletedDate,
+                IsLatestCompletedTradingDate = true,
+                CanUseKiwoomTickFallback = true,
+                HasRawTickDatabase = latestCoverage != null && latestCoverage.IsUsable,
+                RawTickCount = latestCoverage == null ? 0 : latestCoverage.Count
+            });
+
+            // 전 거래일은 DB 유무와 관계없이 목록에 유지한다.
+            // 장마감 후에는 오늘이 기본값이고 전 거래일까지 키움 Tick 대체를 허용한다.
+            if (previousBusinessDate.Date != latestCompletedDate.Date)
+            {
+                StockDbManager.ReplayRawTickCoverage previousCoverage = availableDbDates
+                    .FirstOrDefault(x => x != null && x.TradingDate.Date == previousBusinessDate.Date);
+
+                options.Add(new ReplayTradingDateOption
+                {
+                    TradingDate = previousBusinessDate,
+                    IsLatestCompletedTradingDate = false,
+                    CanUseKiwoomTickFallback = true,
+                    HasRawTickDatabase = previousCoverage != null && previousCoverage.IsUsable,
+                    RawTickCount = previousCoverage == null ? 0 : previousCoverage.Count
+                });
+            }
+
+            foreach (StockDbManager.ReplayRawTickCoverage coverage in availableDbDates)
+            {
+                if (coverage == null || !coverage.IsUsable)
+                    continue;
+
+                if (coverage.TradingDate.Date == latestCompletedDate.Date)
+                    continue;
+
+                options.Add(new ReplayTradingDateOption
+                {
+                    TradingDate = coverage.TradingDate.Date,
+                    IsLatestCompletedTradingDate = false,
+                    CanUseKiwoomTickFallback = coverage.TradingDate.Date == previousBusinessDate.Date,
+                    HasRawTickDatabase = true,
+                    RawTickCount = coverage.Count
+                });
+            }
+
+            options = options
+                .GroupBy(x => x.TradingDate.Date)
+                .Select(x => x.First())
+                .OrderByDescending(x => x.TradingDate)
+                .Take(10)
+                .ToList();
+
+            ReplayTradingDateOption selected = options
+                .FirstOrDefault(x => x.TradingDate.Date == preferredDate.Date)
+                ?? options.FirstOrDefault(x => x.TradingDate.Date == latestCompletedDate.Date)
+                ?? options.FirstOrDefault();
+
+            _suppressReplayTradingDateSelectionChanged = true;
+            try
+            {
+                ReplayTradingDateOptions.Clear();
+                foreach (ReplayTradingDateOption option in options)
+                    ReplayTradingDateOptions.Add(option);
+
+                SelectedReplayTradingDate = selected;
+            }
+            finally
+            {
+                _suppressReplayTradingDateSelectionChanged = false;
+            }
+
+            OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+        }
+
+        private void RequestPreparedReplayDisplayData(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code))
+                return;
+
+            RequestProgramTradeSeedIfAvailable(code);
+
+            _marketApi.RequestMinuteCandles(
+                WindowId,
+                code,
+                ScreenNo,
+                daysToLoad: 2,
+                maxRows: 0,
+                priority: 0);
+
+            _marketApi.RequestRecentTicks(
+                WindowId,
+                code,
+                ScreenNo,
+                minutes: 5,
+                priority: 0);
+
+            ApplyReplayAutoTradingState(false);
+        }
+
+        private async Task ReloadReplayForSelectedDateAsync(
+            ReplayTradingDateOption selected,
+            ReplayTradingDateOption previous)
+        {
+            if (!IsReplayMode || selected == null || Context == null || string.IsNullOrWhiteSpace(Context.Code))
+                return;
+
+            if (_isReplayTradingDateReloading)
+                return;
+
+            _isReplayTradingDateReloading = true;
+            OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+
+            string code = Context.Code;
+            string name = Context.Name;
+            double lastPrice = Context.LastPrice;
+            IsLoading = true;
+
+            try
+            {
+                ForceAutoTradingOffAndSmallScale($"Replay 날짜 변경: {selected.TradingDate:yyyy-MM-dd}");
+
+                if (_marketApi is LocalReplayApiService replayApi)
+                {
+                    replayApi.StopReplay(WindowId);
+                    replayApi.ResetReplaySession(WindowId);
+                }
+
+                ResetCurrentWindowForReplay($"Replay 날짜 변경: {selected.TradingDate:yyyy-MM-dd}");
+                Context.SwitchSymbol(code, name, lastPrice);
+                MarkAutoTradeDataNotReady(code);
+                _autoTradeController?.Reset(code);
+                _marketApi.ReplaceSubscription(WindowId, ScreenNo, code);
+
+                bool replayReady = await PrepareReplayDataForCurrentSymbolAsync(
+                    code,
+                    selected.TradingDate).ConfigureAwait(true);
+
+                if (!replayReady)
+                {
+                    ReplayTradingDateOption restore = previous;
+                    if (restore == null && _lastReadyReplayTradingDate != DateTime.MinValue)
+                    {
+                        restore = ReplayTradingDateOptions.FirstOrDefault(
+                            x => x.TradingDate.Date == _lastReadyReplayTradingDate.Date);
+                    }
+
+                    if (restore != null)
+                    {
+                        _suppressReplayTradingDateSelectionChanged = true;
+                        try
+                        {
+                            SelectedReplayTradingDate = restore;
+                        }
+                        finally
+                        {
+                            _suppressReplayTradingDateSelectionChanged = false;
+                        }
+
+                        bool restoredReady = await PrepareReplayDataForCurrentSymbolAsync(
+                            code,
+                            restore.TradingDate).ConfigureAwait(true);
+
+                        if (restoredReady)
+                        {
+                            _lastReadyReplayTradingDate = restore.TradingDate.Date;
+                            RequestPreparedReplayDisplayData(code);
+                            AddLog($"↩ Replay 이전 날짜 복원 완료: {restore.TradingDate:yyyy-MM-dd}");
+                        }
+                    }
+
+                    return;
+                }
+
+                _lastReadyReplayTradingDate = selected.TradingDate.Date;
+                RequestPreparedReplayDisplayData(code);
+                AddLog(
+                    $"🧪 Replay 날짜 변경 완료: {name}({code}) / " +
+                    $"{selected.TradingDate:yyyy-MM-dd} / Tick={(selected.HasRawTickDatabase ? "DB" : "키움")}");
+            }
+            finally
+            {
+                IsLoading = false;
+                _isReplayTradingDateReloading = false;
+                OnPropertyChanged(nameof(IsReplayDateSelectionEnabled));
+            }
+        }
+
+        private async Task<bool> PrepareReplayDataForCurrentSymbolAsync(
+            string code,
+            DateTime? selectedTradingDate = null)
         {
             if (!IsReplayMode)
                 return true;
@@ -1217,24 +1548,52 @@ namespace MoneyCreator.ViewModels
             if (!(_marketApi is LocalReplayApiService replayApi))
                 return false;
 
-            MainLoadingMessage = $"Replay 원천데이터 준비 중: {code}";
+            DateTime tradingDate = selectedTradingDate.HasValue && selectedTradingDate.Value != DateTime.MinValue
+                ? selectedTradingDate.Value.Date
+                : SelectedReplayTradingDate != null
+                    ? SelectedReplayTradingDate.TradingDate.Date
+                    : ResolveDefaultReplayTradingDate();
+
+            ReplayDataPrepareService.SetRequestedTradingDate(WindowId, code, tradingDate);
+
+            string tickSource = SelectedReplayTradingDate != null && SelectedReplayTradingDate.HasRawTickDatabase
+                ? "틱 DB"
+                : SelectedReplayTradingDate != null && SelectedReplayTradingDate.CanUseKiwoomTickFallback
+                    ? "틱 DB 우선 / 키움 대체"
+                    : "틱 DB 전용";
+
+            MainLoadingMessage =
+                $"{tradingDate:yyyy-MM-dd} Replay 데이터 로딩 중\n" +
+                $"종목: {code} / 분봉: 키움 / {tickSource}";
             IsMainLoading = true;
 
-            var result = await replayApi.PrepareReplayDataAsync(WindowId, code).ConfigureAwait(true);
-
-            IsMainLoading = false;
-            MainLoadingMessage = string.Empty;
-
-            if (result == null || !result.IsReady)
+            ReplayDataPrepareResult result;
+            try
             {
+                result = await replayApi.PrepareReplayDataAsync(WindowId, code).ConfigureAwait(true);
+            }
+            finally
+            {
+                IsMainLoading = false;
+                MainLoadingMessage = string.Empty;
+            }
+
+            if (result == null || !result.IsReady || result.TradingDate.Date != tradingDate.Date)
+            {
+                string dateMismatch = result != null && result.TradingDate != DateTime.MinValue && result.TradingDate.Date != tradingDate.Date
+                    ? $"\n요청일: {tradingDate:yyyy-MM-dd} / 준비일: {result.TradingDate:yyyy-MM-dd}"
+                    : string.Empty;
+
                 MessageBox.Show(
-                    $"Replay 데이터가 부족합니다.\n종목: {code}\n{result?.Message ?? "원천 데이터 없음"}",
+                    $"Replay 데이터가 부족합니다.\n종목: {code}\n일자: {tradingDate:yyyy-MM-dd}\n" +
+                    $"{result?.Message ?? "원천 데이터 없음"}{dateMismatch}",
                     "ReplayMode",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
                 return false;
             }
 
+            _lastReadyReplayTradingDate = tradingDate.Date;
             return true;
         }
 
@@ -1885,9 +2244,19 @@ namespace MoneyCreator.ViewModels
 
             if (IsReplayMode)
             {
+                await RefreshReplayTradingDateOptionsAsync(
+                    symbol.Code,
+                    preserveCurrentSelection: true).ConfigureAwait(true);
+
                 _marketApi.ReplaceSubscription(this.WindowId, ScreenNo, symbol.Code);
 
-                bool replayReady = await PrepareReplayDataForCurrentSymbolAsync(symbol.Code);
+                DateTime selectedTradingDate = SelectedReplayTradingDate == null
+                    ? ResolveDefaultReplayTradingDate()
+                    : SelectedReplayTradingDate.TradingDate.Date;
+
+                bool replayReady = await PrepareReplayDataForCurrentSymbolAsync(
+                    symbol.Code,
+                    selectedTradingDate).ConfigureAwait(true);
                 if (!replayReady)
                 {
                     IsLoading = false;
@@ -1895,23 +2264,9 @@ namespace MoneyCreator.ViewModels
                     return;
                 }
 
-                RequestProgramTradeSeedIfAvailable(symbol.Code);
+                RequestPreparedReplayDisplayData(symbol.Code);
 
-                _marketApi.RequestMinuteCandles(
-                    this.WindowId,
-                    symbol.Code,
-                    ScreenNo,
-                    daysToLoad: 2,
-                    maxRows: 0,
-                    priority: 0);
-
-                _marketApi.RequestRecentTicks(
-                    this.WindowId,
-                    symbol.Code,
-                    ScreenNo,
-                    minutes: 5,
-                    priority: 0);
-
+                _lastReadyReplayTradingDate = selectedTradingDate;
                 ApplyReplayAutoTradingState(IsAutoTradingEnabled);
 
                 IsLoading = false;

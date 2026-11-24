@@ -3,6 +3,7 @@ using MoneyCreator.Models;
 using MoneyCreator.DataBase;
 using MoneyCreator.Service;
 using MoneyCreator.ViewModels;
+using MoneyCreator.AutoTrading;
 using ScottPlot;
 using ScottPlot.ArrowShapes;
 using ScottPlot.AxisRules;
@@ -472,7 +473,14 @@ namespace MoneyCreator
             InitScoreChart();
 
             double x = point.Time.ToOADate();
+            // 차트 바인딩 값만 임계값 돌파 점수로 제한한다.
+            // AnalysisScorePoint 원본, 내부 판단점수, 카드, DB/CSV/로그는 변경하지 않는다.
+            //double y = ResolveScoreChartBindingValue(point.SignalScore); //범위외 점수 0
+
             double y = point.SignalScore;
+
+            if (double.IsNaN(y) || double.IsInfinity(y))
+                y = 0;
 
             if (y < -100) y = -100;
             if (y > 100) y = 100;
@@ -500,6 +508,19 @@ namespace MoneyCreator
             TrimScoreChartPointsIfNeeded();
             UpdateScoreThresholdLines(point);
             RefreshScoreChart();
+        }
+
+        private static double ResolveScoreChartBindingValue(double score)
+        {
+            if (double.IsNaN(score) || double.IsInfinity(score))
+                return 0;
+
+            // +매수 기준 이상 또는 -매도 기준 이하인 돌파 점수만 차트에 표시한다.
+            // AND를 사용하면 +70 이상이면서 -70 이하가 되어 항상 거짓이므로 OR가 맞다.
+            return score >= SignalEngine.BuyScoreThreshold ||
+                   score <= SignalEngine.SellScoreThreshold
+                ? score
+                : 0;
         }
 
         private void UpdateScoreThresholdLines(AnalysisScorePoint point)

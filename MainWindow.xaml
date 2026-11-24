@@ -263,13 +263,31 @@
                            FontWeight="SemiBold"
                            Width="280"
                            VerticalAlignment="Center"
-                           Margin="0,0,40,0"/>
+                           Margin="0,0,0,0"/>
 
-                <Button Content="연결"
-                        Command="{Binding ConnectCommand}"
-                        Width="70"
-                        Height="30"
-                        Margin="0,0,5,0"/>
+                <ComboBox ItemsSource="{Binding ReplayTradingDateOptions}"
+                          SelectedItem="{Binding SelectedReplayTradingDate, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                          DisplayMemberPath="DisplayText"
+                          Width="155"
+                          Height="30"
+                          Margin="0,0,5,0"
+                          Background="#2A2A2A"
+                          Foreground="Black"
+                          BorderBrush="#444"
+                          VerticalContentAlignment="Center"
+                          IsEnabled="{Binding IsReplayDateSelectionEnabled}"
+                          ToolTip="Replay 일자 선택 / 분봉은 키움 TR / 과거 Tick은 RawData DB 전용">
+                    <ComboBox.Style>
+                        <Style TargetType="ComboBox">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsReplayMode}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </ComboBox.Style>
+                </ComboBox>
 
                 <Button Content="📅 전체 보유종목"
                         Command="{Binding OpenAllHoldingsCommand}"

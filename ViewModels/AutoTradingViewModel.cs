@@ -22,6 +22,7 @@ using System.Windows;
 using System.Windows.Data;
 using System.Windows.Threading;
 using MoneyCreator.DataBase;
+using MoneyCreator.ML;
 using HarfBuzzSharp;
 
 namespace MoneyCreator.ViewModels
@@ -231,7 +232,7 @@ namespace MoneyCreator.ViewModels
         private const int MoneyCreatorStrongOpportunityScoreMargin = 15;
         private const int MoneyCreatorStrongOpportunityMinScore = 85;
         private const int AutoTradeBuyRepriceDelayMilliseconds = 3000;
-        private const int AutoTradeBuyRepriceMaxAttemptsPerOrder = 1;
+        private const int AutoTradeBuyRepriceMaxAttemptsPerRequest = AutoTradeCoreWorker.MaxUnfilledBuyRepriceAttempts;
         private const int AutoTradeSellFirstCheckDelayMilliseconds = 4000;
         private const int AutoTradeUrgentSellFirstCheckDelayMilliseconds = 2000;
         private const int AutoTradeSellReplaceCooldownMilliseconds = 5000;
@@ -244,8 +245,7 @@ namespace MoneyCreator.ViewModels
 
         private readonly ConcurrentDictionary<string, bool> _autoCancelWatchMap =
             new ConcurrentDictionary<string, bool>();
-        private readonly ConcurrentDictionary<string, int> _autoTradeBuyRepriceAttemptByOrderNo =
-            new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
         private readonly ConcurrentDictionary<string, int> _autoTradeSellReplaceAttemptByOrderNo =
             new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, DateTime> _lastAutoTradeSellReplaceAtByCode =
@@ -266,6 +266,10 @@ namespace MoneyCreator.ViewModels
 
         private readonly ConcurrentDictionary<string, DecisionCandidateRecord> _pendingDecisionCandidateOutcomeMap =
             new ConcurrentDictionary<string, DecisionCandidateRecord>();
+
+        // BUY execution-risk ML is Shadow-only. It never changes StableFinalScore, Trend authority, or order routing.
+        private readonly BuyExecutionRiskShadowEvaluator _buyExecutionRiskShadowEvaluator =
+            new BuyExecutionRiskShadowEvaluator();
 
         private readonly DispatcherTimer _decisionCandidateOutcomePumpTimer = new DispatcherTimer();
         private const int DecisionCandidateOutcomePumpIntervalSeconds = 5;
@@ -820,8 +824,6 @@ namespace MoneyCreator.ViewModels
         // ============================================================
         // Source: MainWindowViewModel.AutoTrading.Analysis.cs
         // ============================================================
-        private DateTime _lastReplayAnalysisScorePointAt = DateTime.MinValue;
-        private DateTime _lastReplayAnalysisCardUpdateAt = DateTime.MinValue;
         private DateTime _lastReplayOutcomeLabelAt = DateTime.MinValue;
 
         // Replay Auto OFF는 종료가 아니라 일시정지다.
@@ -830,8 +832,8 @@ namespace MoneyCreator.ViewModels
         private string _replayAutoInitializedSessionKey = string.Empty;
         private bool _replayAutoPauseActive;
 
-        // 일반 분석/DB/주문 판단은 Buy/Sell DollarBar가 ValueFilled로 닫힐 때만 1회 진행한다.
-        // Raw Tick은 Bar 생성과 HardStop 안전경로에만 즉시 사용한다.
+        // 새 압력 후보 생성은 Buy/Sell DollarBar가 ValueFilled로 닫힐 때만 1회 진행한다.
+        // Raw Tick은 Bar 생성, HardStop, 그리고 활성 후보의 짧은 가격반응 확인에만 사용한다.
         // UI 버킷은 표시 안정화를 위한 묶음일 뿐 매매 판단 시계가 아니다.
         private const int AutoTradeAnalysisUiRefreshIntervalMs = 1000;
         private readonly object _autoTradeAnalysisUiLock = new object();
@@ -890,6 +892,7 @@ namespace MoneyCreator.ViewModels
             PersistAutoTradeFeatureSnapshotIfNeeded(feature, signal);
             string signalId = PersistAutoTradeSignalLog(feature, signal);
             string candidateId = PersistAutoTradeDecisionCandidateIfNeeded(feature, signal, signalId);
+            EvaluateBuyExecutionRiskShadow(feature, signal, signalId, candidateId);
 
             // CSV는 DB/UI와 독립된 분석 보조 저장이다. 실제 파일 I/O는 DataBase 전용 Writer Thread가 처리한다.
             AutoTradeCsvWriter.Shared.EnqueueFrame(
@@ -902,7 +905,7 @@ namespace MoneyCreator.ViewModels
             ProcessDueMlOutcomeLabels(feature.Time == default(DateTime) ? DateTime.Now : feature.Time);
 
             // 분석 로그는 UI 카드/차트 갱신과 분리한다.
-            // 일반 판단은 [바판단], Raw HardStop 안전경로는 [원시안전]으로 구분해 판단 사건마다 남긴다.
+            // 일반 후보는 [바판단], 후보 Tick 결론은 [후보확인], Raw HardStop은 [원시안전]으로 구분한다.
             WritePerAnalysisBarMinimalLog(feature, signal);
 
             TryCancelBlockingUnfilledOrderFromAnalysis(feature);
@@ -931,11 +934,6 @@ namespace MoneyCreator.ViewModels
                 if (!string.IsNullOrWhiteSpace(msg))
                     AddAutoTradeAnalysisLog(msg);
 
-                // v135: 전체 축 상세는 Action/HardStop/임계값 근처에서만 한 줄 추가한다.
-                // 모든 Hold에 Bar/Flow/Frame/Breakdown 전체를 반복 출력하지 않는다.
-                string axisDetail = BuildAxisDetailAnalysisLog(feature, signal);
-                if (!string.IsNullOrWhiteSpace(axisDetail))
-                    AddAutoTradeAnalysisLog(axisDetail);
             }
             catch (Exception ex)
             {
@@ -948,127 +946,39 @@ namespace MoneyCreator.ViewModels
             if (feature == null)
                 return null;
 
-            DateTime time = feature.Time == default(DateTime) ? DateTime.Now : feature.Time;
+            DateTime time = feature.Time;
             string code = string.IsNullOrWhiteSpace(feature.Code) ? signal?.Code ?? "-" : feature.Code;
             string action = signal == null ? feature.SignalAction : signal.Action.ToString();
-            if (string.IsNullOrWhiteSpace(action))
-                action = "Hold";
-
-            int score = (int)Math.Round(CalculateAnalysisChartScore(feature, signal));
-            string position = feature.HasPosition && feature.HoldingQty > 0
-                ? "Holding"
-                : "Flat";
-            string reason = BuildCompactDecisionReason(feature, signal);
-            SignalScoreBreakdown breakdown = signal == null ? null : signal.ScoreBreakdown;
-
-            double rawPressure = breakdown != null && breakdown.IsReady
-                ? breakdown.RawBarPressureScore
-                : feature.BarSidePressureBias * 100.0;
-            double structure = breakdown != null && breakdown.IsReady
-                ? breakdown.StructureContribution
-                : 0.0;
-            double entryRisk = breakdown != null && breakdown.IsReady
-                ? breakdown.EntryRiskContribution
-                : 0.0;
-            double unifiedExit = breakdown != null && breakdown.IsReady
-                ? breakdown.UnifiedExitContribution
-                : 0.0;
-            string regime = breakdown == null || string.IsNullOrWhiteSpace(breakdown.PriceRegime)
-                ? "-"
-                : breakdown.PriceRegime;
-
+            if (string.IsNullOrWhiteSpace(action)) action = "Hold";
+            SignalScoreBreakdown b = signal == null ? feature.ScoreBreakdown : signal.ScoreBreakdown;
+            double finalScore = b == null ? CalculateAnalysisChartScore(feature, signal) : b.FinalScore;
+            string position = feature.HasPosition && feature.HoldingQty > 0 ? "Holding" : "Flat";
             string pending = feature.HasPendingBuy || feature.HasPendingSell || feature.OpenOrderCount > 0
-                ? string.Format(
-                    CultureInfo.InvariantCulture,
-                    " | 주문=B:{0}/S:{1}/Open:{2}",
-                    feature.HasPendingBuy ? "Y" : "N",
-                    feature.HasPendingSell ? "Y" : "N",
-                    feature.OpenOrderCount)
+                ? string.Format(CultureInfo.InvariantCulture, " | 주문=B:{0}/S:{1}/Open:{2}",
+                    feature.HasPendingBuy ? "Y" : "N", feature.HasPendingSell ? "Y" : "N", feature.OpenOrderCount)
                 : string.Empty;
-
-            string logPrefix = feature.IsClosedDecisionBar
+            string prefix = feature.IsClosedDecisionBar
                 ? "[바판단] "
-                : "[원시안전] ";
+                : string.Equals(
+                      feature.BarTargetMode,
+                      "CandidateTickConfirmation",
+                      StringComparison.OrdinalIgnoreCase)
+                    ? "[후보확인] "
+                    : "[원시안전] ";
 
             return string.Format(
                 CultureInfo.InvariantCulture,
-                "{0}{1} | 종목={2} | 현재가={3} | 점수={4} | 판단={5} | 보유={6}/{7} | 수익률={8:F2}% | Raw={9:+0.0;-0.0;0.0} | Struct={10:+0.0;-0.0;0.0} | Entry={11:+0.0;-0.0;0.0} | Exit={12:+0.0;-0.0;0.0} | Regime={13} | 사유={14}{15}",
-                logPrefix,
-                time.ToString("HH:mm:ss"),
-                code,
-                FormatAnalysisMoney(feature.Price),
-                FormatSignedAnalysisScore(score),
-                action,
-                position,
-                feature.HoldingQty,
-                feature.NetProfitRate,
-                rawPressure,
-                structure,
-                entryRisk,
-                unifiedExit,
-                regime,
-                reason,
-                pending);
+                "{0}{1} | 종목={2} | 현재가={3} | 점수={4:+0.0;-0.0;0.0} | 판단={5} | 보유={6}/{7} | 수익률={8:F2}% | Event={9:+0.0;-0.0;0.0}/M:{10:0.000}/P:{11:0.000} | Pair={12}/M:{13:0.000}/P:{14:0.000} | 사유={15}{16}",
+                prefix, time.ToString("HH:mm:ss"), code, FormatAnalysisMoney(feature.Price), finalScore, action,
+                position, feature.HoldingQty, feature.NetProfitRate,
+                b == null ? 0.0 : b.EventBaseAccelerationEvidence * 100.0,
+                b == null ? 0.0 : b.EventEvidenceMaturity,
+                b == null ? 0.0 : b.EventEvidencePenalty,
+                b == null ? 0 : b.PairSideCompletedCount,
+                b == null ? 0.0 : b.PairEvidenceMaturity,
+                b == null ? 0.0 : b.OppositePairPenalty,
+                BuildCompactDecisionReason(feature, signal), pending);
         }
-
-        private static string BuildAxisDetailAnalysisLog(FeatureSnapshot feature, TradeSignal signal)
-        {
-            if (feature == null || signal == null)
-                return null;
-
-            SignalScoreBreakdown breakdown = signal.ScoreBreakdown;
-            if (breakdown == null || !breakdown.IsReady)
-                return null;
-
-            bool actionEvent = signal.Action != TradeActionType.Hold;
-            bool rawSafetyEvent = !feature.IsClosedDecisionBar;
-            int thresholdDistance = 10;
-            int activeThreshold = signal.Score >= 0
-                ? Math.Max(1, breakdown.BuyThreshold)
-                : Math.Max(1, Math.Abs(breakdown.SellThreshold));
-            bool nearThreshold = Math.Abs(signal.Score) >= Math.Max(0, activeThreshold - thresholdDistance);
-
-            if (!actionEvent && !rawSafetyEvent && !nearThreshold)
-                return null;
-
-            DateTime time = feature.Time == default(DateTime) ? DateTime.Now : feature.Time;
-            string code = string.IsNullOrWhiteSpace(feature.Code) ? signal.Code ?? "-" : feature.Code;
-            string memoryReason = string.IsNullOrWhiteSpace(breakdown.ExitMemoryResetReason)
-                ? "None"
-                : breakdown.ExitMemoryResetReason;
-
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "[축상세] {0} | 종목={1} | PPart=S:{2:+0.0;-0.0;0.0}/T:{3:+0.0;-0.0;0.0}/A:{4:+0.0;-0.0;0.0}/Agr:{5:+0.0;-0.0;0.0}(Raw:{6:+0.0;-0.0;0.0},Ind:{7:0.000}) | AccRaw=B:{8:+0.000;-0.000;0.000}/S:{9:+0.000;-0.000;0.000} | AccNorm=B:{10:+0.000;-0.000;0.000}/S:{11:+0.000;-0.000;0.000} | Drift=B:{12:+0.000;-0.000;0.000}/S:{13:+0.000;-0.000;0.000} | RelAcc={14:+0.0;-0.0;0.0}/Auth:{15:0.000} | Obs=B:{16}/S:{17}/T:{18} | Turn={19:+0.0;-0.0;0.0} | Path={20:+0.0;-0.0;0.0} | ProfitBreak={21:0.000} | ProfitAccept={22:0.000} | PersistApply={23:0.000} | ResidualRisk={24:0.000} | ResidualPenalty={25:0.0} | ExitMemory={26}",
-                time.ToString("HH:mm:ss"),
-                code,
-                breakdown.PressureStatePart,
-                breakdown.PressureTransitionPart,
-                breakdown.PressureAccelerationPart,
-                breakdown.PressureAgreementPart,
-                breakdown.RawPressureAgreementPart,
-                breakdown.AgreementIndependentSupport,
-                breakdown.BuyRawMoneyAcceleration,
-                breakdown.SellRawMoneyAcceleration,
-                breakdown.BuyTargetNormalizedAcceleration,
-                breakdown.SellTargetNormalizedAcceleration,
-                breakdown.BuyTargetDriftContribution,
-                breakdown.SellTargetDriftContribution,
-                breakdown.SignedRelativeAcceleration,
-                breakdown.AccelerationAuthority,
-                breakdown.BuyPressureObservationCount,
-                breakdown.SellPressureObservationCount,
-                breakdown.TransitionObservationCount,
-                breakdown.PressureTurnScore,
-                breakdown.PricePathScore,
-                breakdown.ProfitMarketBreakEvidence,
-                breakdown.ProfitMarketAcceptance,
-                breakdown.PersistentCurrentApplicationAuthority,
-                breakdown.ResidualExitReEntryRisk,
-                breakdown.ResidualExitPenalty,
-                memoryReason);
-        }
-
         private static string BuildCompactDecisionReason(FeatureSnapshot feature, TradeSignal signal)
         {
             string reason = ResolveTradeCardReason(feature, signal);
@@ -1135,25 +1045,6 @@ namespace MoneyCreator.ViewModels
             return first.Length <= 80 ? first : first.Substring(0, 80) + "...";
         }
 
-        private static string BuildCompactScoreSummary(TradeSignal signal)
-        {
-            SignalScoreBreakdown breakdown = signal == null ? null : signal.ScoreBreakdown;
-            if (breakdown == null || !breakdown.IsReady)
-                return null;
-
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "Raw:{0:+0.0;-0.0;0.0}/Struct:{1:+0.0;-0.0;0.0}/Entry:{2:+0.0;-0.0;0.0}/Exit:{3:+0.0;-0.0;0.0}/Final:{4:+0;-0;0}/Th:{5}/{6}/Regime:{7}",
-                breakdown.RawBarPressureScore,
-                breakdown.StructureContribution,
-                breakdown.EntryRiskContribution,
-                breakdown.UnifiedExitContribution,
-                breakdown.FinalScore,
-                breakdown.BuyThreshold,
-                breakdown.SellThreshold,
-                string.IsNullOrWhiteSpace(breakdown.PriceRegime) ? "-" : breakdown.PriceRegime);
-        }
-
 
 
         private static string BuildAnalysisScorePointReason(
@@ -1175,205 +1066,6 @@ namespace MoneyCreator.ViewModels
                 bucket == null ? score : bucket.MinScore,
                 bucket == null ? score : bucket.MaxScore,
                 action);
-        }
-
-        private static string BuildCompactBarSummary(FeatureSnapshot feature)
-        {
-            if (feature == null)
-                return "-";
-
-            string mode = string.IsNullOrWhiteSpace(feature.BarTargetMode)
-                ? "NoBar"
-                : feature.BarTargetMode;
-
-            if (!string.Equals(mode, "Decision", StringComparison.OrdinalIgnoreCase))
-            {
-                return string.Format(
-                    CultureInfo.InvariantCulture,
-                    "{0} Tick={1} Elapsed={2:F1}/15.0s Coverage={3:P0} Value={4} MaxTick={5:P1} Source={6}",
-                    mode,
-                    feature.BarBootstrapTickCount,
-                    feature.BarBootstrapElapsedSeconds,
-                    feature.BarBootstrapCoverageRatio,
-                    FormatCompactAnalysisMoney(feature.BarBootstrapTradeValue),
-                    feature.BarBootstrapLargestTickShare,
-                    string.IsNullOrWhiteSpace(feature.BarBootstrapSource) ? "Live15sFromFirstTick" : feature.BarBootstrapSource);
-            }
-
-            string totalState = feature.DollarBarIsValueFilledClosed
-                ? "Value"
-                : feature.DollarBarIsTimeoutClosed
-                    ? "Timeout"
-                    : feature.DollarBarIsClosed ? "Closed" : "Open";
-
-            string buyState = feature.BuyDollarBarIsValueFilledClosed
-                ? "Value"
-                : feature.BuyDollarBarIsClosed ? "Closed" : "Open";
-
-            string sellState = feature.SellDollarBarIsValueFilledClosed
-                ? "Value"
-                : feature.SellDollarBarIsClosed ? "Closed" : "Open";
-
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "SelectedClose=T:{0}/B:{1}/S:{2} AgeT={3:0}s SelectedFill=T:{4:P0}/B:{5:P0}/S:{6:P0} SelectedSpeed=B:{7:0.00}/S:{8:0.00} Closed60=ValueB:{9}/AllB:{10}/ValueS:{11}/AllS:{12} DTarget={13}->{14}({15:+0.0%;-0.0%;0.0%}) Obs={16} Src={17}/{18:0.###}s Eff={19:0.###}s Trend={20:+0.00;-0.00;0.00} Cf={21:P0} TRel={22:P0} SRel={23:P0} Recent={24:P0} x{25:0.00} SideRatio=B:{26:0.000}/S:{27:0.000}",
-                totalState,
-                buyState,
-                sellState,
-                feature.DollarBarAgeSeconds,
-                feature.DollarBarFillRatio,
-                feature.BuyDollarBarFillRatio,
-                feature.SellDollarBarFillRatio,
-                feature.BuyDollarBarSpeedRatio,
-                feature.SellDollarBarSpeedRatio,
-                feature.BuyDollarBarValueClosedCount60s,
-                feature.BuyDollarBarClosedCount60s,
-                feature.SellDollarBarValueClosedCount60s,
-                feature.SellDollarBarClosedCount60s,
-                FormatCompactAnalysisMoney(feature.BarPreviousTargetTradeValue),
-                FormatCompactAnalysisMoney(feature.BarNextTargetTradeValue),
-                feature.BarDTargetChangeRatio,
-                FormatCompactAnalysisMoney(feature.BarObservedTargetTradeValue),
-                string.IsNullOrWhiteSpace(feature.BarDTargetUpdateReason) ? "-" : feature.BarDTargetUpdateReason,
-                feature.BarDTargetSourceDurationSeconds,
-                feature.BarDTargetEffectiveDurationSeconds,
-                feature.BarDTargetInternalTrend,
-                feature.BarDTargetConfidence,
-                feature.BarDTargetTimeReliability,
-                feature.BarDTargetSampleReliability,
-                feature.BarDTargetRecentConsistency,
-                feature.BarDTargetSourceOvershootRatio,
-                feature.BuyDollarBarTargetRatioToTotal,
-                feature.SellDollarBarTargetRatioToTotal);
-        }
-
-        private static string BuildCompactIndependentFlowSummary(FeatureSnapshot feature)
-        {
-            if (feature == null)
-                return "-";
-
-            string raw = ExtractIndependentBarFlowDiagnostic(feature.LiveBarProgressReason);
-            string official = string.Format(
-                CultureInfo.InvariantCulture,
-                "Evidence=C:{0:+0.00;-0.00;0.00}/L:{1:+0.00;-0.00;0.00} Pressure:{2:+0.00;-0.00;0.00} Price:{3:+0.00;-0.00;0.00} Abs:{4:+0.00;-0.00;0.00} Cf:{5:P0} LiveStrength=B:{6:0.00}/S:{7:0.00}",
-                feature.BarSidePressureValueBias,
-                feature.BarSidePressureSpeedBias,
-                feature.BarSidePressureBias,
-                feature.BarSidePressurePriceReactionBias,
-                feature.BarSidePressureAbsorptionBias,
-                feature.BarSidePressureConfidence,
-                feature.LiveBarProgressBuyScore / 100.0,
-                feature.LiveBarProgressSellScore / 100.0);
-
-            return string.IsNullOrWhiteSpace(raw)
-                ? official
-                : official + " Raw=" + raw;
-        }
-
-        private static string ExtractIndependentBarFlowDiagnostic(string reason)
-        {
-            if (string.IsNullOrWhiteSpace(reason))
-                return string.Empty;
-
-            int start = reason.IndexOf("ClosedSideBarDecision", StringComparison.OrdinalIgnoreCase);
-            if (start < 0)
-                start = reason.IndexOf("IndependentBarFlow", StringComparison.OrdinalIgnoreCase);
-            if (start < 0)
-                return string.Empty;
-
-            string diagnostic = reason.Substring(start).Trim();
-            int separator = diagnostic.IndexOf(" | ", StringComparison.Ordinal);
-            if (separator >= 0)
-                diagnostic = diagnostic.Substring(0, separator).Trim();
-
-            return diagnostic;
-        }
-
-        private static string BuildCompactFrameSummary(FeatureSnapshot feature)
-        {
-            if (feature == null || !feature.IsClosedDecisionBar)
-                return "RawSafety";
-
-            return string.Format(
-                "Type={15}/{16} Ticks={0} OHLC={1:N0}/{2:N0}/{3:N0}/{4:N0} Value={5} B={6} S={7} N={8} Net={9} Direction={10:+0.00;-0.00;0.00} VWAP={11:N0} Strength={12:0.##} Duration={13:0.###}s TimeGap={14}",
-                feature.FrameTickCount,
-                feature.FrameOpenPrice,
-                feature.FrameHighPrice,
-                feature.FrameLowPrice,
-                feature.Price,
-                FormatCompactAnalysisMoney(feature.TickTradeValue),
-                FormatCompactAnalysisMoney(feature.FrameBuyTradeValue),
-                FormatCompactAnalysisMoney(feature.FrameSellTradeValue),
-                FormatCompactAnalysisMoney(feature.FrameNeutralTradeValue),
-                FormatCompactAnalysisMoney(feature.FrameNetBuyTradeValue),
-                feature.FrameDirectionalPurity,
-                feature.FrameVwap,
-                feature.FrameValueWeightedStrength,
-                feature.FrameElapsedSeconds,
-                feature.FrameHasTimeGap ? "Y" : "N",
-                string.IsNullOrWhiteSpace(feature.DecisionBarType) ? "-" : feature.DecisionBarType,
-                string.IsNullOrWhiteSpace(feature.DecisionBarCloseReason) ? "-" : feature.DecisionBarCloseReason);
-        }
-
-        private static string BuildCompactOrderSummary(FeatureSnapshot feature, TradeSignal signal)
-        {
-            if (feature == null)
-                return "-";
-
-            string state = "None";
-            string mode = string.IsNullOrWhiteSpace(feature.BarTargetMode) ? "NoBar" : feature.BarTargetMode;
-            string rawReason = ResolveTradeCardReason(feature, signal);
-            string decisionReason = ExtractDecisionValue(rawReason, "Reason");
-            string operationalState = ExtractDecisionValue(rawReason, "State");
-            string guard = ExtractDecisionValue(rawReason, "Guard");
-
-            if (string.Equals(mode, "RawSafety", StringComparison.OrdinalIgnoreCase))
-                state = feature.HasPendingSell ? "Blocked:PendingSell" : "HardStopRaw";
-            else if (!string.Equals(mode, "Decision", StringComparison.OrdinalIgnoreCase))
-                state = "Blocked:NoDecisionBar";
-            else if (feature.HasPendingBuy || feature.HasPendingSell || feature.OpenOrderCount > 0)
-                state = "Blocked:Pending";
-            else if (!string.IsNullOrWhiteSpace(operationalState))
-                state = "Blocked:" + operationalState;
-            else if (!string.IsNullOrWhiteSpace(guard))
-                state = "Blocked:" + (string.IsNullOrWhiteSpace(decisionReason) ? "Guard" : decisionReason);
-            else if (!string.IsNullOrWhiteSpace(decisionReason) &&
-                     (decisionReason.EndsWith("Block", StringComparison.OrdinalIgnoreCase) ||
-                      decisionReason.EndsWith("Disabled", StringComparison.OrdinalIgnoreCase) ||
-                      decisionReason.StartsWith("NoSellable", StringComparison.OrdinalIgnoreCase)))
-                state = "Blocked:" + decisionReason;
-
-            return string.Format(
-                "{0} Pending=B:{1}/S:{2} Open={3} Cash={4} Remain={5}",
-                state,
-                feature.HasPendingBuy ? "Y" : "N",
-                feature.HasPendingSell ? "Y" : "N",
-                feature.OpenOrderCount,
-                FormatAnalysisMoney(feature.Cash),
-                FormatAnalysisMoney(feature.SymbolRemainingBudget));
-        }
-
-        private static string FormatSignedAnalysisScore(int score)
-        {
-            return score.ToString("+0;-0;0");
-        }
-
-        private static string FormatCompactAnalysisMoney(double value)
-        {
-            if (double.IsNaN(value) || double.IsInfinity(value))
-                return "-";
-
-            double abs = Math.Abs(value);
-            if (abs >= 100000000.0)
-                return (value / 100000000.0).ToString("0.##") + "억";
-
-            if (abs >= 1000000.0)
-                return (value / 1000000.0).ToString("0.#") + "M";
-
-            if (abs >= 1000.0)
-                return (value / 1000.0).ToString("0.#") + "K";
-
-            return value.ToString("N0");
         }
 
         private static string ExtractDecisionValue(string reason, string key)
@@ -1402,14 +1094,6 @@ namespace MoneyCreator.ViewModels
                 return "-";
 
             return value.ToString("N0");
-        }
-
-        private static string FormatAnalysisNumber(double value, string format)
-        {
-            if (double.IsNaN(value) || double.IsInfinity(value))
-                return "-";
-
-            return value.ToString(format);
         }
 
         private void QueueAnalysisUiUpdate(FeatureSnapshot feature, TradeSignal signal)
@@ -1776,23 +1460,6 @@ namespace MoneyCreator.ViewModels
             }
 
             return false;
-        }
-
-        private bool ShouldUpdateAnalysisCard(FeatureSnapshot feature, TradeSignal signal)
-        {
-            if (!IsReplayMlDataSource())
-                return true;
-
-            if (signal != null && signal.Action != TradeActionType.Hold)
-                return true;
-
-            DateTime time = ResolveAnalysisDisplayTime(feature);
-            if (_lastReplayAnalysisCardUpdateAt != DateTime.MinValue &&
-                (time - _lastReplayAnalysisCardUpdateAt).TotalMilliseconds < 1000)
-                return false;
-
-            _lastReplayAnalysisCardUpdateAt = time;
-            return true;
         }
 
         private bool ShouldCreateReplayOutcomeLabel(FeatureSnapshotRecord record)
@@ -2409,6 +2076,96 @@ namespace MoneyCreator.ViewModels
             return ((exitPrice - entryPrice) / entryPrice) * 100.0;
         }
 
+        private void EvaluateBuyExecutionRiskShadow(
+            FeatureSnapshot feature,
+            TradeSignal signal,
+            string signalId,
+            string candidateId)
+        {
+            try
+            {
+                // Shadow dataset and runtime must align with persisted DecisionCandidates.
+                if (feature == null || Db == null || string.IsNullOrWhiteSpace(candidateId))
+                    return;
+
+                if (_autoTradeSettings == null || !_autoTradeSettings.EnableMlDataCollection)
+                    return;
+
+                string finalAction = NormalizeTradeActionName(
+                    signal == null ? feature.SignalAction : signal.Action.ToString());
+
+                if (!string.Equals(finalAction, TradeActionType.Buy.ToString(), StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                DateTime evaluationTime = feature.Time;
+                if (evaluationTime == default(DateTime))
+                    return;
+
+                // Use the exact same runtime-to-FeatureSnapshotRecord mapping used for ML collection.
+                // This prevents trainer/runtime feature semantic drift.
+                FeatureSnapshotRecord input = CreateFeatureSnapshotRecord(feature, signal, evaluationTime);
+                if (input == null)
+                    return;
+
+                ExecutionRiskPrediction prediction = _buyExecutionRiskShadowEvaluator.Evaluate(input);
+
+                double risk = prediction != null && prediction.IsAvailable
+                    ? Math.Max(0.0, Math.Min(1.0, prediction.RiskProbability))
+                    : 0.0;
+                double confidence = prediction != null && prediction.IsAvailable
+                    ? Math.Max(0.0, Math.Min(1.0, prediction.Confidence))
+                    : 0.0;
+
+                int ruleScore = signal == null ? feature.SignalScore : signal.Score;
+                string strategyName = signal == null ? feature.StrategyName : signal.StrategyName;
+
+                var record = new LocalMlEvaluationRecord
+                {
+                    EvaluationId = Guid.NewGuid().ToString("N"),
+                    SnapshotId = feature.SnapshotId,
+                    SignalId = signalId,
+                    CandidateId = candidateId,
+                    Code = feature.Code,
+                    EvaluationTime = evaluationTime,
+                    ModelKey = prediction == null ? BuyExecutionRiskShadowEvaluator.ExpectedModelKey : prediction.ModelKey,
+                    ModelName = prediction == null ? "BuyExecutionRiskShadow" : prediction.ModelName,
+                    ModelVersion = prediction == null ? null : prediction.ModelVersion,
+                    EvaluatorType = prediction == null ? "LogisticRegression" : prediction.EvaluatorType,
+                    FeatureSchemaVersion = prediction == null ? null : prediction.FeatureSchemaVersion,
+                    RuntimeMode = "Shadow",
+                    DataSourceType = GetMlDataSourceType(),
+                    IsReplay = IsReplayMlDataSource(),
+                    MlSessionId = BuildMlSessionId(feature.Code, evaluationTime),
+                    IsEnabled = true,
+                    IsAvailable = prediction != null && prediction.IsAvailable,
+                    IsAppliedToTrading = false,
+                    InfluenceRatio = 0.0,
+                    RuleAction = finalAction,
+                    FinalAction = finalAction,
+                    RuleScore = ruleScore,
+                    FinalScore = ruleScore,
+                    StrategyName = strategyName,
+                    TradeMode = feature.BarPhase.ToString(),
+                    Direction = "BUY_EXECUTION_RISK",
+                    Score = risk,
+                    Confidence = confidence,
+                    BuyQualityScore = prediction != null && prediction.IsAvailable ? 1.0 - risk : 0.0,
+                    SellRiskScore = 0.0,
+                    AvoidScore = risk,
+                    ExpectedReturn = 0.0,
+                    ExpectedDrawdown = 0.0,
+                    Reason = prediction == null ? "BUY Shadow prediction unavailable" : prediction.Reason,
+                    CreatedAt = DateTime.Now
+                };
+
+                Db.EnqueueLocalMlEvaluation(record);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[BUY ExecutionRisk Shadow 평가 실패] " + ex.Message);
+            }
+        }
+
         private string PersistAutoTradeDecisionCandidateIfNeeded(FeatureSnapshot feature, TradeSignal signal, string signalId)
         {
             try
@@ -2419,9 +2176,9 @@ namespace MoneyCreator.ViewModels
                 if (_autoTradeSettings == null || !_autoTradeSettings.EnableMlDataCollection)
                     return null;
 
-                DateTime decisionTime = feature.Time == default(DateTime)
-                    ? DateTime.Now
-                    : feature.Time;
+                DateTime decisionTime = feature.Time;
+                if (decisionTime == default(DateTime))
+                    return null;
 
                 var candidate = CreateDecisionCandidateRecord(feature, signal, decisionTime, signalId);
                 if (candidate == null)
@@ -2454,13 +2211,8 @@ namespace MoneyCreator.ViewModels
             string reason = signal == null ? feature.SignalReason : signal.Reason;
             string actionCandidate = ResolveDecisionActionCandidate(finalAction, reason);
             string strategyName = ResolveDecisionCandidateStrategyName(signal, actionCandidate, finalAction, reason);
-
-            // AutoTrading(3)(65) 이후에는 SignalEngine의 점수분해값이
-            // TradeSignal.ScoreBreakdown으로 구조화되어 넘어온다.
-            // 우선 구조화값을 저장하고, 구버전 AutoTrading/Guard 로그처럼 구조화값이 없는 경우에만
-            // 기존 Reason 문자열 파싱으로 fallback한다.
-            SignalScoreBreakdown structuredBreakdown = signal == null ? null : signal.ScoreBreakdown;
-            var fallbackBreakdown = structuredBreakdown == null ? ParseScoreBreakdown(reason) : null;
+            SignalScoreBreakdown b = signal == null ? feature.ScoreBreakdown : signal.ScoreBreakdown;
+            double official = b == null ? (signal == null ? 0.0 : signal.Score) : b.FinalScore;
 
             return new DecisionCandidateRecord
             {
@@ -2475,15 +2227,15 @@ namespace MoneyCreator.ViewModels
                 SignalScore = signal == null ? 0 : signal.Score,
                 StrategyName = strategyName,
                 TradeMode = feature.BarPhase.ToString(),
-                BaseFinal = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "Base"),
-                EntryScore = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "Entry"),
-                ExitScore = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "Exit"),
-                ExpectedMoveScore = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "Expected"),
-                WeakFlowPenalty = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "WeakFlowPenalty"),
-                HighChasePenalty = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "HighChasePenalty"),
-                CostRecoveryHoldScore = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "CostRecoveryHold"),
-                AdversePersist = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "AdversePersist"),
-                EffectiveCostRate = ReadBreakdownValue(structuredBreakdown, fallbackBreakdown, "EffectiveCost"),
+                BaseFinal = official,
+                EntryScore = official,
+                ExitScore = official,
+                RawAccelerationScore = b == null ? 0.0 : b.RawAccelerationEvidence * 100.0,
+                AppliedAccelerationScore = b == null ? official : b.AppliedAccelerationEvidence * 100.0,
+                EventMaturity = b == null ? 0.0 : b.EventEvidenceMaturity,
+                PairCompletedCount = b == null ? 0 : b.PairSideCompletedCount,
+                PairOppositionPenalty = b == null ? 0.0 : b.OppositePairPenalty,
+                DecisionEventKey = b == null ? string.Empty : b.DecisionEventKey,
                 Reason = reason,
                 DataSourceType = GetMlDataSourceType(),
                 IsReplay = IsReplayMlDataSource(),
@@ -2560,28 +2312,6 @@ namespace MoneyCreator.ViewModels
                    ContainsIgnoreCase(value, "StrongPlus") ||
                    ContainsIgnoreCase(value, "Strong") ||
                    ContainsIgnoreCase(value, "Watch");
-        }
-
-        private static string ExtractReasonToken(string reason, string key)
-        {
-            if (string.IsNullOrWhiteSpace(reason) || string.IsNullOrWhiteSpace(key))
-                return string.Empty;
-
-            var match = Regex.Match(
-                reason,
-                Regex.Escape(key) + @"[:=]([^,/| ]+)",
-                RegexOptions.IgnoreCase);
-
-            return match.Success ? match.Groups[1].Value.Trim() : string.Empty;
-        }
-
-        private static double ExtractReasonDouble(string reason, string key)
-        {
-            string token = ExtractReasonToken(reason, key);
-            double value;
-            return double.TryParse(token, NumberStyles.Any, CultureInfo.InvariantCulture, out value)
-                ? value
-                : 0.0;
         }
 
         private bool ShouldSkipDuplicateAnalysisWatchCandidate(DecisionCandidateRecord candidate)
@@ -2934,7 +2664,7 @@ namespace MoneyCreator.ViewModels
 
             return string.Format(
                 CultureInfo.InvariantCulture,
-                "[라벨분석] {0}/{1} N={2} Outcome={3:+0.00;-0.00;0.00}% Pos={4:0}% MFE={5:+0.00;-0.00;0.00}% MAE={6:+0.00;-0.00;0.00}% R1/3/5/10={7:+0.00;-0.00;0.00}/{8:+0.00;-0.00;0.00}/{9:+0.00;-0.00;0.00}/{10:+0.00;-0.00;0.00}% Score Final/Base/Entry/Exit={11:+0.0;-0.0;0.0}/{12:+0.0;-0.0;0.0}/{13:+0.0;-0.0;0.0}/{14:+0.0;-0.0;0.0} First=P:{15:0}%/S:{16:0}%",
+                "[라벨분석] {0}/{1} N={2} Outcome={3:+0.00;-0.00;0.00}% Pos={4:0}% MFE={5:+0.00;-0.00;0.00}% MAE={6:+0.00;-0.00;0.00}% R1/3/5/10={7:+0.00;-0.00;0.00}/{8:+0.00;-0.00;0.00}/{9:+0.00;-0.00;0.00}/{10:+0.00;-0.00;0.00}% Score={11:+0.0;-0.0;0.0} Raw/Applied={12:+0.0;-0.0;0.0}/{13:+0.0;-0.0;0.0} EventM={14:0.000} Pair={15:0.00}/Penalty:{16:0.000} First=P:{17:0}%/S:{18:0}%",
                 string.IsNullOrWhiteSpace(row.CategoryName) ? "ALL" : row.CategoryName,
                 string.IsNullOrWhiteSpace(row.ActionCandidate) ? "Hold" : row.ActionCandidate,
                 row.CandidateCount,
@@ -2947,96 +2677,20 @@ namespace MoneyCreator.ViewModels
                 row.AvgActionReturnAfter5m,
                 row.AvgActionReturnAfter10m,
                 row.AvgSignalScore,
-                row.AvgBaseFinal,
-                row.AvgEntryScore,
-                row.AvgExitScore,
+                row.AvgRawAccelerationScore,
+                row.AvgAppliedAccelerationScore,
+                row.AvgEventMaturity,
+                row.AvgPairCompletedCount,
+                row.AvgPairOppositionPenalty,
                 row.ProfitFirstRate * 100.0,
                 row.StopFirstRate * 100.0);
         }
 
-        private static Dictionary<string, double> ParseScoreBreakdown(string reason)
-        {
-            var result = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            if (string.IsNullOrWhiteSpace(reason))
-                return result;
 
-            int idx = reason.IndexOf("ScoreBreakdown=", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0)
-                return result;
 
-            string tail = reason.Substring(idx + "ScoreBreakdown=".Length);
-            int end = tail.IndexOf(" | ", StringComparison.Ordinal);
-            if (end >= 0)
-                tail = tail.Substring(0, end);
 
-            foreach (var part in tail.Split('/'))
-            {
-                if (string.IsNullOrWhiteSpace(part))
-                    continue;
 
-                int colon = part.IndexOf(':');
-                if (colon <= 0)
-                    continue;
 
-                string key = part.Substring(0, colon).Trim();
-                string raw = part.Substring(colon + 1).Trim().Replace("+", string.Empty);
-                double value;
-                if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out value) ||
-                    double.TryParse(raw, NumberStyles.Float, CultureInfo.CurrentCulture, out value))
-                {
-                    result[key] = value;
-                }
-            }
-
-            return result;
-        }
-
-        private static double ReadBreakdownValue(
-            SignalScoreBreakdown structuredBreakdown,
-            Dictionary<string, double> fallbackBreakdown,
-            string key)
-        {
-            if (structuredBreakdown != null)
-            {
-                if (string.Equals(key, "Base", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.BaseFinal;
-
-                if (string.Equals(key, "Entry", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.EntryScore;
-
-                if (string.Equals(key, "Exit", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.ExitScore;
-
-                if (string.Equals(key, "Expected", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.ExpectedMoveScore;
-
-                if (string.Equals(key, "WeakFlowPenalty", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.WeakFlowPenalty;
-
-                if (string.Equals(key, "HighChasePenalty", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.HighChasePenalty;
-
-                if (string.Equals(key, "CostRecoveryHold", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.CostRecoveryHoldScore;
-
-                if (string.Equals(key, "AdversePersist", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.AdversePersist;
-
-                if (string.Equals(key, "EffectiveCost", StringComparison.OrdinalIgnoreCase))
-                    return structuredBreakdown.EffectiveCostRate;
-            }
-
-            return ReadBreakdownValue(fallbackBreakdown, key);
-        }
-
-        private static double ReadBreakdownValue(Dictionary<string, double> breakdown, string key)
-        {
-            if (breakdown == null || string.IsNullOrWhiteSpace(key))
-                return 0;
-
-            double value;
-            return breakdown.TryGetValue(key, out value) ? value : 0;
-        }
 
         private string PersistAutoTradeSignalLog(FeatureSnapshot feature, TradeSignal signal)
         {
@@ -3128,51 +2782,6 @@ namespace MoneyCreator.ViewModels
             };
         }
 
-        private LocalMlEvaluationRecord CreateLocalMlEvaluationRecord(
-            FeatureSnapshot feature,
-            TradeSignal signal,
-            DateTime signalTime,
-            string signalId)
-        {
-            return new LocalMlEvaluationRecord
-            {
-                EvaluationId = Guid.NewGuid().ToString("N"),
-                SnapshotId = feature == null ? null : feature.SnapshotId,
-                SignalId = signalId,
-                Code = feature == null ? signal?.Code : feature.Code,
-                EvaluationTime = signalTime,
-                ModelKey = "BAR_MINIMAL_DISABLED",
-                ModelName = "BarMinimal",
-                ModelVersion = null,
-                EvaluatorType = "Disabled",
-                FeatureSchemaVersion = "BarMinimal",
-                RuntimeMode = "Disabled",
-                IsEnabled = false,
-                IsAvailable = false,
-                IsAppliedToTrading = false,
-                InfluenceRatio = 0,
-                RuleAction = signal == null ? "HOLD" : signal.Action.ToString(),
-                FinalAction = signal == null ? "HOLD" : signal.Action.ToString(),
-                RuleScore = signal == null ? 0 : signal.Score,
-                FinalScore = signal == null ? 0 : signal.Score,
-                StrategyName = signal == null ? null : signal.StrategyName,
-                TradeMode = feature == null ? null : feature.BarPhase.ToString(),
-                Direction = null,
-                Score = 0,
-                Confidence = 0,
-                BuyQualityScore = 0,
-                SellRiskScore = 0,
-                AvoidScore = 0,
-                ExpectedReturn = 0,
-                ExpectedDrawdown = 0,
-                Reason = "BarMinimal: LocalML disabled",
-                DataSourceType = GetMlDataSourceType(),
-                IsReplay = IsReplayMlDataSource(),
-                MlSessionId = BuildMlSessionId(feature == null ? signal?.Code : feature.Code, signalTime),
-                CreatedAt = DateTime.Now
-            };
-        }
-
 
         private bool IsReplayMlDataSource()
         {
@@ -3198,10 +2807,7 @@ namespace MoneyCreator.ViewModels
 
         private static DateTime ResolveAnalysisDisplayTime(FeatureSnapshot feature)
         {
-            if (feature != null && feature.Time != default(DateTime))
-                return feature.Time;
-
-            return DateTime.Now;
+            return feature == null ? default(DateTime) : feature.Time;
         }
 
         private void PublishAnalysisScorePoint(FeatureSnapshot feature, TradeSignal signal)
@@ -3493,13 +3099,37 @@ namespace MoneyCreator.ViewModels
 
                 code = signal.Code;
                 quantity = signal.Quantity;
-                price = signal.Price <= 0 ? 0 : (int)Math.Round(signal.Price);
+                int signalPrice = signal.Price <= 0
+                    ? 0
+                    : (int)Math.Round(signal.Price);
+                price = signalPrice;
 
                 actionName = signal.Action == TradeActionType.Buy
                     ? "자동매수"
                     : "자동매도";
 
                 bool hardStopOrder = IsHardStopOrderSignal(signal);
+
+                // v293 일반 Buy/Sell은 분석이 유효했던 SignalPrice를 최초 지정가로 보호한다.
+                // 주문 큐 처리 사이에 CurrentPrice가 고점/저점으로 이동해도 최초 주문가를 덮어쓰지 않는다.
+                // HardStop만 가격품질보다 즉시 청산이 우선이므로 기존처럼 주문 직전 현재가를 사용한다.
+                // PVLiveEntry/PVAccumTurn은 기존 신호가 상한 지정가 정책을 그대로 유지한다.
+                if (hardStopOrder)
+                {
+                    int currentExecutionPrice =
+                        ResolveAutoTradeCurrentPriceForPreOrder(code);
+                    if (currentExecutionPrice > 0)
+                        price = currentExecutionPrice;
+                }
+
+                if (signal.Action == TradeActionType.Buy &&
+                    request != null &&
+                    request.InitialBuyOrderPrice <= 0 &&
+                    price > 0)
+                {
+                    request.InitialBuyOrderPrice = price;
+                    request.BuyRepriceAttemptCount = 0;
+                }
                 if (hardStopOrder)
                 {
                     // Core의 StopLossLock 전량매도 수량을 실제 보유수량으로 한 번 더 동기화한다.
@@ -3536,7 +3166,16 @@ namespace MoneyCreator.ViewModels
                 }
 
                 stage = "REQUEST_RECEIVED";
-                LogMoneyCreatorOrderFlow(stage, actionName, code, quantity, price, "Core 주문후보 수신");
+                LogMoneyCreatorOrderFlow(
+                    stage,
+                    actionName,
+                    code,
+                    quantity,
+                    price,
+                    "Core 주문후보 수신 / SignalPrice=" +
+                    signalPrice.ToString("N0") +
+                    " / ExecutionPrice=" +
+                    price.ToString("N0"));
 
                 stage = "ORDER_EXEC_START";
                 LogMoneyCreatorOrderFlow(stage, actionName, code, quantity, price, "주문 실행 시작");
@@ -4200,6 +3839,16 @@ namespace MoneyCreator.ViewModels
             if (string.IsNullOrWhiteSpace(SelectedAccount))
                 return;
 
+            if (request != null &&
+                request.Signal != null &&
+                request.Signal.Action == TradeActionType.Buy &&
+                request.InitialBuyOrderPrice <= 0)
+            {
+                request.InitialBuyOrderPrice =
+                    (int)Math.Round(Math.Max(0.0, request.Signal.Price));
+                request.BuyRepriceAttemptCount = 0;
+            }
+
             // 자동취소 감시는 늦게 걸면 안 되므로 먼저 등록한다.
             ScheduleAutoTradeCancelIfUnfilled(request);
 
@@ -4520,109 +4169,6 @@ namespace MoneyCreator.ViewModels
             return strategy.IndexOf("StopLoss", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    strategy.IndexOf("EmergencyExit", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    strategy.IndexOf("RiskExit", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private int ResolveUrgentSellLimitPrice(OrderRequest request)
-        {
-            if (request == null || request.Signal == null)
-                return 0;
-
-            double price = 0;
-
-            if (Context != null &&
-                !string.IsNullOrWhiteSpace(Context.Code) &&
-                NormalizeMoneyCreatorCode(Context.Code) == NormalizeMoneyCreatorCode(request.Signal.Code) &&
-                Context.LastPrice > 0)
-            {
-                price = Context.LastPrice;
-            }
-
-            if (price <= 0 && request.Signal.Price > 0)
-                price = request.Signal.Price;
-
-            if (price <= 0)
-                return 0;
-
-            return Math.Max(1, (int)Math.Round(price));
-        }
-
-        private void RequestUrgentAutoTradeSellCorrection(
-            OrderRequest request,
-            string orderNo,
-            int untradedQty)
-        {
-            if (request == null || request.Signal == null)
-                return;
-
-            if (request.Signal.Action != TradeActionType.Sell)
-                return;
-
-            if (!IsUrgentAutoTradeSellSignal(request.Signal))
-                return;
-
-            if (string.IsNullOrWhiteSpace(orderNo) || untradedQty <= 0)
-                return;
-
-            Application.Current?.Dispatcher.BeginInvoke(
-                DispatcherPriority.Send,
-                new Action(async () =>
-                {
-                    int result = _marketApi.SendOrder(
-                        WindowId,
-                        ScreenNo,
-                        SelectedAccount,
-                        6,
-                        request.Signal.Code,
-                        untradedQty,
-                        0,
-                        "03",
-                        orderNo);
-
-                    if (result == 0)
-                    {
-                        AddAutoTradeAnalysisLog(
-                            $"[긴급매도 정정] {request.Signal.Code} / {request.Signal.StrategyName} / " +
-                            $"시장가정정 {untradedQty}주 / 원주문={orderNo}");
-
-                        await RequestAccountStateRefreshAfterTrade("긴급매도 시장가정정 " + request.Signal.Code);
-                        return;
-                    }
-
-                    int limitPrice = ResolveUrgentSellLimitPrice(request);
-                    if (limitPrice <= 0)
-                    {
-                        AddAutoTradeAnalysisLog(
-                            $"[긴급매도 정정실패] {request.Signal.Code} / 시장가 result={result} / " +
-                            "지정가 fallback 가격 없음");
-                        return;
-                    }
-
-                    int fallbackResult = _marketApi.SendOrder(
-                        WindowId,
-                        ScreenNo,
-                        SelectedAccount,
-                        6,
-                        request.Signal.Code,
-                        untradedQty,
-                        limitPrice,
-                        "00",
-                        orderNo);
-
-                    if (fallbackResult == 0)
-                    {
-                        AddAutoTradeAnalysisLog(
-                            $"[긴급매도 정정] {request.Signal.Code} / {request.Signal.StrategyName} / " +
-                            $"지정가정정 {untradedQty}주 / {limitPrice:N0}원 / 원주문={orderNo}");
-
-                        await RequestAccountStateRefreshAfterTrade("긴급매도 지정가정정 " + request.Signal.Code);
-                    }
-                    else
-                    {
-                        AddAutoTradeAnalysisLog(
-                            $"[긴급매도 정정실패] {request.Signal.Code} / 시장가 result={result} / " +
-                            $"지정가 result={fallbackResult} / 원주문={orderNo}");
-                    }
-                }));
         }
 
         private void TrySchedulePendingSellReplaceFromAnalysisOnUi(string code)
@@ -5028,16 +4574,12 @@ namespace MoneyCreator.ViewModels
             if (string.IsNullOrWhiteSpace(cancelableOrder.OrderNo) || cancelableOrder.UntradedQty <= 0)
                 return false;
 
-            int attemptCount = _autoTradeBuyRepriceAttemptByOrderNo.AddOrUpdate(
-                cancelableOrder.OrderNo,
-                1,
-                (orderNo, old) => old + 1);
-
-            if (attemptCount > AutoTradeBuyRepriceMaxAttemptsPerOrder)
+            int attemptCount = Math.Max(0, request.BuyRepriceAttemptCount);
+            if (attemptCount >= AutoTradeBuyRepriceMaxAttemptsPerRequest)
             {
                 AddAutoTradeAnalysisLog(
                     $"[매수미체결 정정제외] {request.Signal.Code} / 원주문={cancelableOrder.OrderNo} / " +
-                    $"시도횟수 초과 {attemptCount}/{AutoTradeBuyRepriceMaxAttemptsPerOrder}");
+                    $"주문요청 기준 시도횟수 {attemptCount}/{AutoTradeBuyRepriceMaxAttemptsPerRequest}");
                 return false;
             }
 
@@ -5187,6 +4729,9 @@ namespace MoneyCreator.ViewModels
 
                     if (result == 0)
                     {
+                        request.BuyRepriceAttemptCount = Math.Min(
+                            AutoTradeBuyRepriceMaxAttemptsPerRequest,
+                            request.BuyRepriceAttemptCount + 1);
                         request.Signal.Price = newPrice;
                         request.HogaType = "00";
 
@@ -5201,7 +4746,8 @@ namespace MoneyCreator.ViewModels
 
                         AddAutoTradeAnalysisLog(
                             $"[매수미체결 정정] {request.Signal.Code} / {request.Signal.StrategyName} / " +
-                            $"{cancelableOrder.UntradedQty}주 / {newPrice:N0}원 / 원주문={cancelableOrder.OrderNo} / {reason}");
+                            $"{cancelableOrder.UntradedQty}주 / {newPrice:N0}원 / 원주문={cancelableOrder.OrderNo} / " +
+                            $"시도={request.BuyRepriceAttemptCount}/{AutoTradeBuyRepriceMaxAttemptsPerRequest} / {reason}");
 
                         await RequestAccountStateRefreshAfterTrade("자동매수 미체결 정정 " + request.Signal.Code);
                         ScheduleAutoTradeCancelIfUnfilled(request);
@@ -5278,8 +4824,6 @@ namespace MoneyCreator.ViewModels
                             "자동취소 전송성공");
                         RefreshCurrentSymbolAllocationTextFromCore();
 
-                        int removedRepriceAttempt;
-                        _autoTradeBuyRepriceAttemptByOrderNo.TryRemove(orderNo, out removedRepriceAttempt);
 
                         AddAutoTradeAnalysisLog(
                             $"[자동취소] {request.Signal.Code} / 미체결 {untradedQty}주 / 원주문={orderNo}");
@@ -6466,16 +6010,6 @@ namespace MoneyCreator.ViewModels
             SynchronizeMoneyCreatorCashFromCurrentKiwoomSnapshot(reason);
         }
 
-        private bool IsMoneyCreatorSellRefreshPendingForCode(string code)
-        {
-            string key = NormalizeMoneyCreatorCode(code);
-            if (string.IsNullOrWhiteSpace(key))
-                return false;
-
-            lock (_moneyCreatorAccountRefreshSyncRoot)
-                return _moneyCreatorPendingSellRefreshCodes.Contains(key);
-        }
-
         private void ReconcileMoneyCreatorAcceptedBuyReservationsWithUnfilledOrders(
             List<OrderInfo> unfilledOrders,
             string reason)
@@ -6550,12 +6084,6 @@ namespace MoneyCreator.ViewModels
 
             SynchronizeMoneyCreatorCashFromCurrentKiwoomSnapshot(reason);
             RefreshCurrentSymbolAllocationTextFromCore();
-        }
-
-        private static long GetMoneyCreatorAcceptedBuyReservationTotal()
-        {
-            lock (_moneyCreatorPortfolioSyncRoot)
-                return (long)_moneyCreatorAcceptedBuyReservedByCode.Values.Sum(x => Math.Max(0, x));
         }
 
         private long GetMoneyCreatorSharedAvailableCash(List<MainWindowViewModel> viewModels)
@@ -6798,86 +6326,6 @@ namespace MoneyCreator.ViewModels
 
             order.Status = "취소요청";
             order.OrderStatus = OrderStatus.Cancelled;
-        }
-
-        private void ApplyFilledOrderToHoldingsOnUi(string code, string name, string orderType, int filledQty, double filledPrice)
-        {
-            if (filledQty <= 0 || filledPrice <= 0 || string.IsNullOrWhiteSpace(code))
-                return;
-
-            string normalizedCode = NormalizeMoneyCreatorCode(code);
-            if (string.IsNullOrWhiteSpace(normalizedCode))
-                return;
-
-            if (AccountHoldings == null)
-                AccountHoldings = new ObservableCollection<HoldingInfo>();
-
-            var holding = AccountHoldings.FirstOrDefault(x =>
-                x != null && NormalizeMoneyCreatorCode(x.Code) == normalizedCode);
-
-            bool isBuy = !string.IsNullOrWhiteSpace(orderType) && orderType.Contains("매수");
-            bool isSell = !string.IsNullOrWhiteSpace(orderType) && orderType.Contains("매도");
-
-            if (isBuy)
-            {
-                if (holding == null)
-                {
-                    holding = new HoldingInfo
-                    {
-                        Code = normalizedCode,
-                        Name = name,
-                        Quantity = filledQty,
-                        EntryPrice = filledPrice,
-                        CurrentPrice = filledPrice
-                    };
-                    AccountHoldings.Add(holding);
-                }
-                else
-                {
-                    int oldQty = Math.Max(0, holding.Quantity);
-                    double oldEntry = holding.EntryPrice > 0 ? holding.EntryPrice : filledPrice;
-                    int newQty = oldQty + filledQty;
-                    holding.EntryPrice = newQty <= 0
-                        ? filledPrice
-                        : ((oldQty * oldEntry) + (filledQty * filledPrice)) / newQty;
-                    holding.Quantity = newQty;
-                    holding.CurrentPrice = filledPrice;
-                    if (string.IsNullOrWhiteSpace(holding.Name))
-                        holding.Name = name;
-                }
-            }
-            else if (isSell)
-            {
-                if (holding != null)
-                {
-                    holding.Quantity = Math.Max(0, holding.Quantity - filledQty);
-                    holding.CurrentPrice = filledPrice;
-                    if (holding.Quantity <= 0)
-                        AccountHoldings.Remove(holding);
-                }
-            }
-
-            if (holding != null)
-                holding.RefreshProfitStatus();
-
-            if (Context != null && NormalizeMoneyCreatorCode(Context.Code) == normalizedCode)
-            {
-                var currentHolding = AccountHoldings.FirstOrDefault(x =>
-                    x != null && NormalizeMoneyCreatorCode(x.Code) == normalizedCode);
-
-                Context.CurrentHold = currentHolding;
-                HoldingQty = currentHolding == null ? 0 : currentHolding.Quantity;
-
-                _autoTradeController?.UpdatePosition(
-                    normalizedCode,
-                    HoldingQty,
-                    currentHolding == null ? 0 : currentHolding.EntryPrice,
-                    ResolveAutoTradePositionTimestamp());
-            }
-
-            OnPropertyChanged(nameof(AccountHoldings));
-            OnPropertyChanged(nameof(HoldingQty));
-            OnPropertyChanged(nameof(TradeCardHoldingQty));
         }
 
         private static double CalculateMoneyCreatorSymbolWeight(FeatureSnapshot f, AutoTradeSettings settings)
@@ -7178,21 +6626,6 @@ namespace MoneyCreator.ViewModels
                 " / 적용매도세금=" + GetMoneyCreatorEstimatedSellTaxRate().ToString("P3"));
         }
 
-        private static double BlendMoneyCreatorCostRate(double current, double observed)
-        {
-            current = ClampMoneyCreatorCostRate(current, 0, 0.05);
-            observed = ClampMoneyCreatorCostRate(observed, 0, 0.05);
-
-            if (observed <= 0)
-                return current;
-
-            if (current <= 0)
-                return observed;
-
-            double blended = (current * 0.70) + (observed * 0.30);
-            return ClampMoneyCreatorCostRate(Math.Max(blended, observed * 0.90), 0, 0.05);
-        }
-
         private void ApplyMoneyCreatorEstimatedTradingCostToSettingsLocked()
         {
             double buyFeeRate = NormalizeMoneyCreatorDomesticFeeRate(_moneyCreatorEstimatedBuyFeeRate);
@@ -7216,22 +6649,6 @@ namespace MoneyCreator.ViewModels
                 _autoTradeSettings.EstimatedSellFeeRate = 0.0;
                 _autoTradeSettings.EstimatedSellTaxRate = 0.0;
             }
-        }
-
-        private void RefreshMoneyCreatorHoldingProfitRates()
-        {
-            if (AccountHoldings == null)
-                return;
-
-            foreach (var holding in AccountHoldings)
-            {
-                if (holding == null)
-                    continue;
-
-                holding.RefreshProfitStatus();
-            }
-
-            OnPropertyChanged(nameof(AccountHoldings));
         }
 
         private bool IsBuyOrderTypeCode(int orderType)
@@ -7428,30 +6845,6 @@ namespace MoneyCreator.ViewModels
                 $"[예수금 정정예약] {reason} / {originalOrder.Code} / " +
                 $"기존예약={oldAmount:N0} / 신규예약={newAmount:N0} / " +
                 $"변동={delta:N0} / 키움동기화={KiwoomSyncedBalance:N0} / 사용가능={CurrentBalance:N0}");
-        }
-
-        private long GetPendingBuyAmount()
-        {
-            // 과거 호환용으로 메서드는 유지한다.
-            // 예수금 계산에는 직접 사용하지 않고, 종목별 할당/미체결 동기화에서 예약금으로 반영한다.
-            if (OrderHistory == null)
-                return 0;
-
-            long amount = 0;
-
-            foreach (var order in OrderHistory)
-            {
-                if (!IsPendingBuyOrder(order))
-                    continue;
-
-                int price = ResolveOrderPriceForCash(order);
-                if (price <= 0)
-                    continue;
-
-                amount += CalculateBuyReserveCashAmount(order.UntradedQty, price);
-            }
-
-            return amount;
         }
 
         public bool IsAutoTradingSmallScale
@@ -8230,7 +7623,7 @@ namespace MoneyCreator.ViewModels
         // ============================================================
         // 자동매매 분석 카드 바인딩 속성
         // - XAML의 TradeCardAccentBrush / TradeCard* 바인딩 대상
-        // - AddAutoTradeAnalysisLog()에서 최신 분석 로그를 파싱해 갱신한다.
+        // - QueueAnalysisUiUpdate()가 FeatureSnapshot/TradeSignal을 직접 반영한다.
         // ============================================================
         private Brush _tradeCardAccentBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(36, 52, 71));
         public Brush TradeCardAccentBrush
@@ -8395,221 +7788,6 @@ namespace MoneyCreator.ViewModels
             TiRexPredictionText = "TiRex 대기";
             TiRexPredictionDetail = "-";
             CurrentSymbolAllocationText = "할당 -";
-        }
-
-        private string GetLogField(Dictionary<string, string> fields, string key, string fallback = "-")
-        {
-            if (fields == null || string.IsNullOrWhiteSpace(key))
-                return fallback;
-
-            return fields.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
-                ? value.Trim()
-                : fallback;
-        }
-        private Dictionary<string, string> ParseAutoTradeAnalysisFields(string msg)
-        {
-            var result = new Dictionary<string, string>();
-
-            if (string.IsNullOrWhiteSpace(msg))
-                return result;
-
-            string text = msg;
-
-            if (text.StartsWith("[틱분석]"))
-                text = text.Substring("[틱분석]".Length).Trim();
-
-            var parts = text.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
-
-            foreach (var part in parts)
-            {
-                string item = part.Trim();
-
-                if (string.IsNullOrWhiteSpace(item))
-                    continue;
-
-                int eqIndex = item.IndexOf('=');
-                if (eqIndex <= 0)
-                    continue;
-
-                string key = item.Substring(0, eqIndex).Trim();
-                string value = item.Substring(eqIndex + 1).Trim();
-
-                if (string.IsNullOrWhiteSpace(key))
-                    continue;
-
-                result[key] = value;
-            }
-
-            return result;
-        }
-        private void UpdateTradeAnalysisCardFromLog(string msg)
-        {
-            if (string.IsNullOrWhiteSpace(msg))
-                return;
-
-            bool isTickAnalysis = msg.Contains("종목=") || msg.Contains("[틱분석]");
-            bool isSignalLog = msg.StartsWith("[Signal]", StringComparison.OrdinalIgnoreCase);
-
-            if (!isTickAnalysis && !isSignalLog)
-            {
-                Application.Current?.Dispatcher.BeginInvoke(
-                    DispatcherPriority.DataBind,
-                    new Action(() =>
-                    {
-                        TradeCardUpdatedAt = DateTime.Now.ToString("HH:mm:ss");
-
-                        TradeCardTitle =
-                            Context != null && !string.IsNullOrWhiteSpace(Context.Name)
-                                ? Context.Name
-                                : "자동매매 분석";
-
-                        TradeCardCode =
-                            Context != null && !string.IsNullOrWhiteSpace(Context.Code)
-                                ? Context.Code
-                                : "-";
-
-                        TradeCardReason = msg;
-
-                        ApplyTradeCardBrushes(TradeCardAction, TradeCardProfitRate);
-                    }));
-
-                return;
-            }
-
-            Application.Current?.Dispatcher.BeginInvoke(DispatcherPriority.DataBind,
-                new Action(() =>
-                {
-                    TradeCardUpdatedAt = DateTime.Now.ToString("HH:mm:ss");
-
-                    if (isSignalLog)
-                    {
-                        var tokens = msg.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-
-                        if (tokens.Length >= 2)
-                            TradeCardAction = tokens[1];
-
-                        string parsedCode = null;
-
-                        foreach (var token in tokens)
-                        {
-                            string cleaned = token.Trim();
-
-                            if (Regex.IsMatch(cleaned, @"^\d{6}$"))
-                            {
-                                parsedCode = cleaned;
-                                break;
-                            }
-                        }
-
-                        if (!string.IsNullOrWhiteSpace(parsedCode))
-                        {
-                            TradeCardCode = parsedCode;
-
-                            TradeCardTitle =
-                                Context != null &&
-                                Context.Code == parsedCode &&
-                                !string.IsNullOrWhiteSpace(Context.Name)
-                                    ? Context.Name
-                                    : parsedCode;
-                        }
-                        else
-                        {
-                            // 코드가 없는 Signal 로그에서는 기존 종목정보 유지.
-                            // Pullback/Breakout 같은 전략명을 Title/Code에 넣지 않는다.
-                            TradeCardCode =
-                                Context != null && !string.IsNullOrWhiteSpace(Context.Code)
-                                    ? Context.Code
-                                    : TradeCardCode;
-
-                            TradeCardTitle =
-                                Context != null && !string.IsNullOrWhiteSpace(Context.Name)
-                                    ? Context.Name
-                                    : TradeCardTitle;
-                        }
-
-                        var scoreMatch = Regex.Match(msg, @"score=(\d+)");
-                        if (scoreMatch.Success)
-                            TradeCardScore = scoreMatch.Groups[1].Value;
-
-                        var slashParts = msg.Split('/');
-
-                        if (slashParts.Length >= 2)
-                            TradeCardStrategy = slashParts[1].Trim();
-
-                        if (slashParts.Length >= 3)
-                            TradeCardReason = slashParts[2].Trim();
-
-                        if (string.IsNullOrWhiteSpace(TradeCardPhase))
-                            TradeCardPhase = "-";
-
-                        if (string.IsNullOrWhiteSpace(TradeCardMarketPhase))
-                            TradeCardMarketPhase = "-";
-
-                        if (string.IsNullOrWhiteSpace(TradeCardTradeMode))
-                            TradeCardTradeMode = "-";
-
-                        ApplyTradeCardBrushes(TradeCardAction, TradeCardProfitRate);
-                        return;
-                    }
-
-                    var fields = ParseAutoTradeAnalysisFields(msg);
-
-                    string code = GetLogField(fields, "종목", Context?.Code ?? "-");
-                    string action = GetLogField(fields, "판단", "HOLD");
-                    string profitRate = GetLogField(fields, "수익률", "-");
-
-                    string marketTrend = GetLogField(fields, "시장", "-");
-                    string symbolPhase = GetLogField(fields, "종목국면", "-");
-
-                    TradeCardCode = IsValidStockCode(code)
-                        ? code
-                        : Context?.Code ?? "-";
-
-                    TradeCardTitle =
-                        Context != null &&
-                        Context.Code == TradeCardCode &&
-                        !string.IsNullOrWhiteSpace(Context.Name)
-                            ? Context.Name
-                            : TradeCardCode;
-
-                    TradeCardAction = action;
-                    TradeCardScore = GetLogField(fields, "점수", "-");
-                    TradeCardPrice = GetLogField(fields, "현재가", "-");
-                    TradeCardHoldingQty = GetLogField(fields, "보유수량", "-");
-                    TradeCardProfitRate = profitRate;
-                    TradeCardOneMinuteChange = GetLogField(fields, "1분등락", "-");
-                    TradeCardThreeMinuteChange = GetLogField(fields, "3분등락", "-");
-                    TradeCardStrength = GetLogField(fields, "체결강도", "-");
-                    TradeCardVolumeRatio = GetLogField(fields, "거래량비율", "-");
-                    TradeCardBidAskRatio = GetLogField(fields, "매수우위", "-");
-
-                    // 시장 전체 상태: Bear / Bull / Panic / Sideways 등
-                    TradeCardPhase = string.IsNullOrWhiteSpace(marketTrend)
-                        ? "-"
-                        : marketTrend;
-
-                    // 종목 자체 국면: Pullback / Breakout / Unstable 등
-                    TradeCardMarketPhase = string.IsNullOrWhiteSpace(symbolPhase)
-                        ? "-"
-                        : symbolPhase;
-
-                    TradeCardTradeMode = GetLogField(fields, "매매모드", GetLogField(fields, "TradeMode", "-"));
-                    TradeCardStrategy = GetLogField(fields, "전략", "-");
-                    string logReason = GetLogField(fields, "판단사유", msg);
-                    string scoreSummary = GetLogField(fields, "점수구성", null);
-                    TradeCardReason = string.IsNullOrWhiteSpace(scoreSummary)
-                        ? logReason
-                        : logReason + " / " + scoreSummary;
-
-                    ApplyTradeCardBrushes(action, profitRate);
-                }));
-        }
-        private bool IsValidStockCode(string code)
-        {
-            if (string.IsNullOrWhiteSpace(code))
-                return false;
-
-            return Regex.IsMatch(code.Trim(), @"^\d{6}$");
         }
 
         private void ApplyTradeCardBrushes(string action, string profitRateText)

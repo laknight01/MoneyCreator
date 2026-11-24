@@ -7,6 +7,7 @@ using System.Data;
 using System.Data.SQLite;
 using System.Diagnostics;
 using System.IO;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -578,6 +579,7 @@ namespace MoneyCreator.DataBase
             if (conn == null)
                 return;
 
+            EnsureColumnExists(conn, "LocalMlEvaluationLogs", "CandidateId", "TEXT");
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "ModelKey", "TEXT");
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "ModelName", "TEXT");
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "ModelVersion", "TEXT");
@@ -603,6 +605,7 @@ namespace MoneyCreator.DataBase
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "ExpectedReturn", "REAL DEFAULT 0");
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "ExpectedDrawdown", "REAL DEFAULT 0");
             EnsureColumnExists(conn, "LocalMlEvaluationLogs", "Reason", "TEXT");
+            conn.Execute("CREATE INDEX IF NOT EXISTS idx_local_ml_candidate ON LocalMlEvaluationLogs (CandidateId);");
         }
 
         // 기존 날짜별 ML DB가 이미 만들어진 경우에도 누락 컬럼을 자동 보강한다.
@@ -667,12 +670,12 @@ namespace MoneyCreator.DataBase
             EnsureColumnExists(conn, "DecisionCandidates", "BaseFinal", "REAL DEFAULT 0");
             EnsureColumnExists(conn, "DecisionCandidates", "EntryScore", "REAL DEFAULT 0");
             EnsureColumnExists(conn, "DecisionCandidates", "ExitScore", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "ExpectedMoveScore", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "WeakFlowPenalty", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "HighChasePenalty", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "CostRecoveryHoldScore", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "AdversePersist", "REAL DEFAULT 0");
-            EnsureColumnExists(conn, "DecisionCandidates", "EffectiveCostRate", "REAL DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "RawAccelerationScore", "REAL DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "AppliedAccelerationScore", "REAL DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "EventMaturity", "REAL DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "PairCompletedCount", "INTEGER DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "PairOppositionPenalty", "REAL DEFAULT 0");
+            EnsureColumnExists(conn, "DecisionCandidates", "DecisionEventKey", "TEXT");
             EnsureColumnExists(conn, "DecisionCandidates", "Reason", "TEXT");
             EnsureColumnExists(conn, "DecisionCandidates", "DataSourceType", "TEXT DEFAULT 'Real'");
             EnsureColumnExists(conn, "DecisionCandidates", "IsReplay", "INTEGER DEFAULT 0");
@@ -1182,33 +1185,6 @@ namespace MoneyCreator.DataBase
 
                 InsertTradeResult(result);
             }
-        }
-        private double CalculateMatchedExecutionAmount(List<OrderInfo> orders, int targetQty)
-        {
-            if (orders == null || targetQty <= 0)
-                return 0;
-
-            int remainQty = targetQty;
-            double amount = 0;
-
-            foreach (var order in orders)
-            {
-                if (order == null || remainQty <= 0)
-                    break;
-
-                int qty = Math.Abs(order.ExecQty);
-                double price = GetExecutionPrice(order);
-
-                if (qty <= 0 || price <= 0)
-                    continue;
-
-                int useQty = Math.Min(remainQty, qty);
-
-                amount += price * useQty;
-                remainQty -= useQty;
-            }
-
-            return amount;
         }
 
         private SignalLogRecord ResolveTiRexForTrade(string code, DateTime entryTime)
@@ -1813,6 +1789,74 @@ namespace MoneyCreator.DataBase
             }
 
             return coverage;
+        }
+
+        public List<ReplayRawTickCoverage> GetReplayAvailableRawTickDates(
+            string code,
+            DateTime latestAllowedDate,
+            int maxCount = 10)
+        {
+            var result = new List<ReplayRawTickCoverage>();
+            string normalizedCode = NormalizeReplayRawTickCode(code);
+
+            if (string.IsNullOrWhiteSpace(normalizedCode) || maxCount <= 0)
+                return result;
+
+            DateTime latestDate = latestAllowedDate == DateTime.MinValue
+                ? DateTime.Today
+                : latestAllowedDate.Date;
+
+            string currentRawPath = new SQLiteConnectionStringBuilder(_rawConnStr).DataSource;
+            string rawDirectory = Path.GetDirectoryName(currentRawPath);
+
+            if (string.IsNullOrWhiteSpace(rawDirectory) || !Directory.Exists(rawDirectory))
+                return result;
+
+            var candidateDates = new List<DateTime>();
+
+            try
+            {
+                foreach (string path in Directory.GetFiles(rawDirectory, "RawData_*.db"))
+                {
+                    string fileName = Path.GetFileNameWithoutExtension(path);
+                    if (string.IsNullOrWhiteSpace(fileName) || !fileName.StartsWith("RawData_", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string rawDate = fileName.Substring("RawData_".Length);
+                    DateTime date;
+                    if (!DateTime.TryParseExact(rawDate, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
+                        continue;
+
+                    if (date.Date > latestDate)
+                        continue;
+
+                    candidateDates.Add(date.Date);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLog?.Invoke("[Replay 날짜목록 조회 실패] " + ex.Message);
+                return result;
+            }
+
+            foreach (DateTime date in candidateDates.Distinct().OrderByDescending(x => x))
+            {
+                DateTime fromTime = date.AddHours(9);
+                DateTime toTime = date.AddHours(15).AddMinutes(20).AddSeconds(59).AddMilliseconds(999);
+                ReplayRawTickCoverage coverage = GetReplayRawTickCoverage(
+                    normalizedCode,
+                    date,
+                    fromTime,
+                    toTime);
+
+                if (coverage != null && coverage.IsUsable)
+                    result.Add(coverage);
+
+                if (result.Count >= maxCount)
+                    break;
+            }
+
+            return result;
         }
 
         public List<ReplayRawTickPageRecord> LoadReplayRawTickPage(
@@ -2576,6 +2620,11 @@ namespace MoneyCreator.DataBase
                     AVG(IFNULL(d.BaseFinal, 0)) AS AvgBaseFinal,
                     AVG(IFNULL(d.EntryScore, 0)) AS AvgEntryScore,
                     AVG(IFNULL(d.ExitScore, 0)) AS AvgExitScore,
+                    AVG(IFNULL(d.RawAccelerationScore, 0)) AS AvgRawAccelerationScore,
+                    AVG(IFNULL(d.AppliedAccelerationScore, 0)) AS AvgAppliedAccelerationScore,
+                    AVG(IFNULL(d.EventMaturity, 0)) AS AvgEventMaturity,
+                    AVG(IFNULL(d.PairCompletedCount, 0)) AS AvgPairCompletedCount,
+                    AVG(IFNULL(d.PairOppositionPenalty, 0)) AS AvgPairOppositionPenalty,
                     AVG(IFNULL(o.ActionReturnAfter1m, 0)) AS AvgActionReturnAfter1m,
                     AVG(IFNULL(o.ActionReturnAfter3m, 0)) AS AvgActionReturnAfter3m,
                     AVG(IFNULL(o.ActionReturnAfter5m, 0)) AS AvgActionReturnAfter5m,
@@ -3919,6 +3968,7 @@ namespace MoneyCreator.DataBase
                         EvaluationId TEXT PRIMARY KEY,
                         SnapshotId TEXT,
                         SignalId TEXT,
+                        CandidateId TEXT,
                         Code TEXT NOT NULL,
                         EvaluationTime DATETIME NOT NULL,
                         ModelKey TEXT,
@@ -3971,12 +4021,12 @@ namespace MoneyCreator.DataBase
                         BaseFinal REAL DEFAULT 0,
                         EntryScore REAL DEFAULT 0,
                         ExitScore REAL DEFAULT 0,
-                        ExpectedMoveScore REAL DEFAULT 0,
-                        WeakFlowPenalty REAL DEFAULT 0,
-                        HighChasePenalty REAL DEFAULT 0,
-                        CostRecoveryHoldScore REAL DEFAULT 0,
-                        AdversePersist REAL DEFAULT 0,
-                        EffectiveCostRate REAL DEFAULT 0,
+                        RawAccelerationScore REAL DEFAULT 0,
+                        AppliedAccelerationScore REAL DEFAULT 0,
+                        EventMaturity REAL DEFAULT 0,
+                        PairCompletedCount INTEGER DEFAULT 0,
+                        PairOppositionPenalty REAL DEFAULT 0,
+                        DecisionEventKey TEXT,
                         Reason TEXT,
                         DataSourceType TEXT DEFAULT 'Real',
                         IsReplay INTEGER DEFAULT 0,
@@ -4108,12 +4158,12 @@ namespace MoneyCreator.DataBase
                         BaseFinal REAL DEFAULT 0,
                         EntryScore REAL DEFAULT 0,
                         ExitScore REAL DEFAULT 0,
-                        ExpectedMoveScore REAL DEFAULT 0,
-                        WeakFlowPenalty REAL DEFAULT 0,
-                        HighChasePenalty REAL DEFAULT 0,
-                        CostRecoveryHoldScore REAL DEFAULT 0,
-                        AdversePersist REAL DEFAULT 0,
-                        EffectiveCostRate REAL DEFAULT 0,
+                        RawAccelerationScore REAL DEFAULT 0,
+                        AppliedAccelerationScore REAL DEFAULT 0,
+                        EventMaturity REAL DEFAULT 0,
+                        PairCompletedCount INTEGER DEFAULT 0,
+                        PairOppositionPenalty REAL DEFAULT 0,
+                        DecisionEventKey TEXT,
                         Reason TEXT,
                         DataSourceType TEXT DEFAULT 'Real',
                         IsReplay INTEGER DEFAULT 0,
@@ -4457,20 +4507,20 @@ namespace MoneyCreator.DataBase
             INSERT OR REPLACE INTO DecisionCandidates (
                 CandidateId, SnapshotId, SignalId, Code, DecisionTime, Price,
                 ActionCandidate, FinalAction, SignalScore, StrategyName, TradeMode,
-                BaseFinal, EntryScore, ExitScore, ExpectedMoveScore, WeakFlowPenalty,
-                HighChasePenalty, CostRecoveryHoldScore, AdversePersist, EffectiveCostRate,
+                BaseFinal, EntryScore, ExitScore, RawAccelerationScore, AppliedAccelerationScore,
+                EventMaturity, PairCompletedCount, PairOppositionPenalty, DecisionEventKey,
                 Reason, DataSourceType, IsReplay, MlSessionId, CreatedAt
             ) VALUES (
                 @CandidateId, @SnapshotId, @SignalId, @Code, @DecisionTime, @Price,
                 @ActionCandidate, @FinalAction, @SignalScore, @StrategyName, @TradeMode,
-                @BaseFinal, @EntryScore, @ExitScore, @ExpectedMoveScore, @WeakFlowPenalty,
-                @HighChasePenalty, @CostRecoveryHoldScore, @AdversePersist, @EffectiveCostRate,
+                @BaseFinal, @EntryScore, @ExitScore, @RawAccelerationScore, @AppliedAccelerationScore,
+                @EventMaturity, @PairCompletedCount, @PairOppositionPenalty, @DecisionEventKey,
                 @Reason, @DataSourceType, @IsReplay, @MlSessionId, @CreatedAt
             );";
 
         private const string SqlInsertLocalMlEvaluation = @"
             INSERT OR REPLACE INTO LocalMlEvaluationLogs (
-                EvaluationId, SnapshotId, SignalId, Code, EvaluationTime,
+                EvaluationId, SnapshotId, SignalId, CandidateId, Code, EvaluationTime,
                 ModelKey, ModelName, ModelVersion, EvaluatorType, FeatureSchemaVersion, RuntimeMode,
                 IsEnabled, IsAvailable, IsAppliedToTrading, InfluenceRatio,
                 RuleAction, FinalAction, RuleScore, FinalScore, StrategyName, TradeMode,
@@ -4478,7 +4528,7 @@ namespace MoneyCreator.DataBase
                 ExpectedReturn, ExpectedDrawdown, Reason,
                 DataSourceType, IsReplay, MlSessionId, CreatedAt
             ) VALUES (
-                @EvaluationId, @SnapshotId, @SignalId, @Code, @EvaluationTime,
+                @EvaluationId, @SnapshotId, @SignalId, @CandidateId, @Code, @EvaluationTime,
                 @ModelKey, @ModelName, @ModelVersion, @EvaluatorType, @FeatureSchemaVersion, @RuntimeMode,
                 @IsEnabled, @IsAvailable, @IsAppliedToTrading, @InfluenceRatio,
                 @RuleAction, @FinalAction, @RuleScore, @FinalScore, @StrategyName, @TradeMode,

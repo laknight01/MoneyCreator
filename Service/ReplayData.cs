@@ -4,6 +4,7 @@
 // 목적: 파일 난립 방지. ViewModel/AutoTrading 기존 흐름은 그대로 두고 IMarketApiService 이벤트 데이터만 대체한다.
 // ------------------------------------------------------------------------------
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -16,6 +17,7 @@ using MoneyCreator.Service;
 
 namespace MoneyCreator.Service.Replay
 {
+
     // ============================================================
     // Source: ReplaySessionOptions.cs
     // ============================================================
@@ -1317,6 +1319,85 @@ namespace MoneyCreator.Service.Replay
 
     public sealed class ReplayDataPrepareService
     {
+        // Replay 선택 날짜 전달을 기존 IMarketApiService 계약 변경 없이 이 준비 서비스 안에서 공통 관리한다.
+        // 별도 최상위 Registry 형식을 두지 않아 MainWindowViewModel/KiwoomApiService의 컴파일 참조가 분리되지 않는다.
+        private static readonly ConcurrentDictionary<string, DateTime> RequestedTradingDateByWindowCode =
+            new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, DateTime> RequestedMinuteTargetDateByWindowCode =
+            new ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        public static void SetRequestedTradingDate(string windowId, string code, DateTime tradingDate)
+        {
+            if (string.IsNullOrWhiteSpace(windowId) ||
+                string.IsNullOrWhiteSpace(code) ||
+                tradingDate == DateTime.MinValue)
+            {
+                return;
+            }
+
+            RequestedTradingDateByWindowCode[BuildRequestedDateKey(windowId, code)] = tradingDate.Date;
+        }
+
+        private static bool TryTakeRequestedTradingDate(
+            string windowId,
+            string code,
+            out DateTime tradingDate)
+        {
+            tradingDate = DateTime.MinValue;
+            if (string.IsNullOrWhiteSpace(windowId) || string.IsNullOrWhiteSpace(code))
+                return false;
+
+            return RequestedTradingDateByWindowCode.TryRemove(
+                BuildRequestedDateKey(windowId, code),
+                out tradingDate);
+        }
+
+        private static void SetRequestedMinuteTargetDate(
+            string windowId,
+            string code,
+            DateTime tradingDate)
+        {
+            if (string.IsNullOrWhiteSpace(windowId) ||
+                string.IsNullOrWhiteSpace(code) ||
+                tradingDate == DateTime.MinValue)
+            {
+                return;
+            }
+
+            RequestedMinuteTargetDateByWindowCode[BuildRequestedDateKey(windowId, code)] = tradingDate.Date;
+        }
+
+        public static bool TryGetRequestedMinuteTargetDate(
+            string windowId,
+            string code,
+            out DateTime tradingDate)
+        {
+            tradingDate = DateTime.MinValue;
+            if (string.IsNullOrWhiteSpace(windowId) || string.IsNullOrWhiteSpace(code))
+                return false;
+
+            return RequestedMinuteTargetDateByWindowCode.TryGetValue(
+                BuildRequestedDateKey(windowId, code),
+                out tradingDate);
+        }
+
+        private static void RemoveRequestedMinuteTargetDate(string windowId, string code)
+        {
+            if (string.IsNullOrWhiteSpace(windowId) || string.IsNullOrWhiteSpace(code))
+                return;
+
+            DateTime ignored;
+            RequestedMinuteTargetDateByWindowCode.TryRemove(
+                BuildRequestedDateKey(windowId, code),
+                out ignored);
+        }
+
+        private static string BuildRequestedDateKey(string windowId, string code)
+        {
+            return (windowId ?? string.Empty).Trim() + "|" +
+                   (code ?? string.Empty).Trim();
+        }
+
         private readonly IMarketApiService _liveApi;
         private readonly ReplayMemoryDataStore _memoryStore;
         private readonly object _prepareLock = new object();
@@ -1367,6 +1448,10 @@ namespace MoneyCreator.Service.Replay
                     ? DateTime.Today
                     : tradingDate.Date;
 
+                DateTime selectedDate;
+                if (TryTakeRequestedTradingDate(windowId, code, out selectedDate))
+                    requestedDate = selectedDate.Date;
+
                 string requestKey = Guid.NewGuid().ToString("N").Substring(0, 8);
 
                 // 중요:
@@ -1377,18 +1462,16 @@ namespace MoneyCreator.Service.Replay
                 string tickWindowId = $"RPTICK{windowId}{requestKey}";
                 string hogaWindowId = $"RPHOGA{windowId}{requestKey}";
 
-                // Replay 거래일은 달력 계산으로 추정하지 않는다.
-                // 과거분봉 TR의 첫 수신 페이지에서 확인된 실제 최신 일자를 기준으로
-                // 분봉/틱/호가/프로그램매매를 동일한 하루로 맞춘다.
+                // 사용자가 선택한 날짜가 Replay 거래일의 최종 권한이다.
+                // 키움 분봉은 최신 페이지부터 목표일까지 연속조회하되 응답 날짜로 선택일을 덮어쓰지 않는다.
                 var minuteResult = await CollectMinuteCandlesAsync(
                     minuteWindowId,
                     code,
+                    requestedDate,
                     token).ConfigureAwait(false);
 
                 var minuteCandles = minuteResult.Candles;
-                tradingDate = minuteResult.TradingDate == DateTime.MinValue
-                    ? requestedDate
-                    : minuteResult.TradingDate.Date;
+                tradingDate = requestedDate.Date;
 
                 _memoryStore.Clear(code, tradingDate);
 
@@ -1406,9 +1489,9 @@ namespace MoneyCreator.Service.Replay
                 {
                     dbSelectionMessage = "DBManager 없음";
                 }
-                else if (minuteResult.TradingDate == DateTime.MinValue)
+                else if (minuteCandles.Count == 0)
                 {
-                    dbSelectionMessage = "TR 거래일 미확정";
+                    dbSelectionMessage = "선택일 분봉 없음";
                 }
                 else
                 {
@@ -1477,17 +1560,38 @@ namespace MoneyCreator.Service.Replay
                 else
                 {
                     token.ThrowIfCancellationRequested();
-                    await DelayBeforeNextReplayTrAsync(token).ConfigureAwait(false);
 
-                    // DB가 없거나 Side가 온전하지 않을 때만 기존 opt10079 경로를 사용한다.
-                    // 한 Replay 세션 안에서 DB와 TR Tick을 섞지 않는다.
-                    ticks = minuteResult.TradingDate == DateTime.MinValue
-                        ? new List<TrackedSymbol>()
-                        : await CollectTicksAsync(
+                    DateTime latestCompletedTradingDate = ResolveReplayTradingDate(DateTime.Now, DateTime.MinValue);
+                    DateTime previousBusinessDate = ResolvePreviousBusinessDay(DateTime.Now.Date);
+                    bool allowKiwoomTickFallback =
+                        tradingDate.Date == latestCompletedTradingDate.Date ||
+                        tradingDate.Date == previousBusinessDate.Date;
+
+                    if (minuteCandles.Count == 0)
+                    {
+                        ticks = new List<TrackedSymbol>();
+                        dbSelectionMessage = "선택일 분봉 없음 - Tick TR 생략";
+                    }
+                    else if (!allowKiwoomTickFallback)
+                    {
+                        // 최신 완료 거래일보다 과거인 날짜는 RawData_yyyyMMdd DB 전용이다.
+                        // 키움 opt10079는 과거 날짜 완전수집을 보장하지 않으므로 호출 자체를 하지 않는다.
+                        ticks = new List<TrackedSymbol>();
+                        dbSelectionMessage =
+                            $"과거일 DB 전용 - RawData_{tradingDate:yyyyMMdd}.db에 사용 가능한 종목 Tick 없음";
+                    }
+                    else
+                    {
+                        await DelayBeforeNextReplayTrAsync(token).ConfigureAwait(false);
+
+                        // 최신 완료 거래일과 직전 거래일만 DB가 없거나 Side가 온전하지 않을 때 opt10079로 대체한다.
+                        // 한 Replay 세션 안에서 DB와 TR Tick을 섞지 않는다.
+                        ticks = await CollectTicksAsync(
                             tickWindowId,
                             code,
                             tradingDate,
                             token).ConfigureAwait(false);
+                    }
 
                     var replayTicksForSeed = ticks ?? new List<TrackedSymbol>();
                     analysisSeedTicks = replayTicksForSeed
@@ -1557,6 +1661,16 @@ namespace MoneyCreator.Service.Replay
                     ? $"프로그램매매 저장데이터 사용 / Program={programTrades.Count:N0}개"
                     : "프로그램매매 저장데이터 없음 - Replay 분석에서 제외";
 
+                bool replayReady = tickCount > 0 && minuteCandles.Count > 0;
+                string minuteMessage = string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "MinuteTarget={0:yyyyMMdd} / Minute={1:N0}개 / Pages={2:N0} / ReplayNext={3:N0} / MinuteStop={4}",
+                    tradingDate,
+                    minuteCandles.Count,
+                    minuteResult.ReceivedPageCount,
+                    minuteResult.ReplayContinuationRequestCount,
+                    string.IsNullOrWhiteSpace(minuteResult.StopReason) ? "-" : minuteResult.StopReason);
+
                 return new ReplayDataPrepareResult
                 {
                     Code = code,
@@ -1568,7 +1682,7 @@ namespace MoneyCreator.Service.Replay
                     TickSourceName = tickSourceName,
                     FirstTickTime = firstTickTime,
                     LastTickTime = lastTickTime,
-                    Message = $"Replay 준비 완료 / Source={tickSourceName} / {tickMessage} / {hogaMessage} / {programMessage}"
+                    Message = $"{(replayReady ? "Replay 준비 완료" : "Replay 준비 실패")} / {minuteMessage} / Source={tickSourceName} / {tickMessage} / {hogaMessage} / {programMessage}"
                 };
             }
             catch (OperationCanceledException)
@@ -1729,16 +1843,97 @@ namespace MoneyCreator.Service.Replay
         {
             public DateTime TradingDate { get; set; }
             public List<MinuteCandleRecord> Candles { get; set; } = new List<MinuteCandleRecord>();
+            public int ReceivedPageCount { get; set; }
+            public int ReplayContinuationRequestCount { get; set; }
+            public string StopReason { get; set; }
         }
+
+        private const int ReplayMinuteMaxContinuationRequests = 40;
+        private const int ReplayMinuteContinuationDelayMilliseconds = 350;
+        private const int ReplayMinuteMaxRepeatedTerminalPages = 3;
 
         private async Task<ReplayMinuteCollectResult> CollectMinuteCandlesAsync(
             string windowId,
             string code,
+            DateTime targetTradingDate,
             CancellationToken token)
         {
+            DateTime targetDate = targetTradingDate == DateTime.MinValue
+                ? ResolveReplayTradingDate(DateTime.Now, DateTime.MinValue)
+                : targetTradingDate.Date;
+
             var rawCandles = new List<MinuteCandleRecord>();
-            var tcs = new TaskCompletionSource<bool>();
-            DateTime firstReceivedTradingDate = DateTime.MinValue;
+            var stateLock = new object();
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            string minuteScreenNo = _liveApi.GetScreenNo();
+            string lastTerminalPageSignature = string.Empty;
+            string stopReason = "Waiting";
+            int receivedPageCount = 0;
+            int continuationRequestCount = 0;
+            int repeatedTerminalPageCount = 0;
+            int continuationRequestPending = 0;
+            bool targetDateObserved = false;
+
+            void Complete(string reason)
+            {
+                lock (stateLock)
+                    stopReason = string.IsNullOrWhiteSpace(reason) ? "Completed" : reason;
+
+                tcs.TrySetResult(true);
+            }
+
+            void RequestReplayContinuation()
+            {
+                if (tcs.Task.IsCompleted || token.IsCancellationRequested)
+                    return;
+
+                if (Interlocked.CompareExchange(ref continuationRequestPending, 1, 0) != 0)
+                    return;
+
+                int requestNo = Interlocked.Increment(ref continuationRequestCount);
+                if (requestNo > ReplayMinuteMaxContinuationRequests)
+                {
+                    Interlocked.Exchange(ref continuationRequestPending, 0);
+                    Complete("ReplayContinuationLimit");
+                    return;
+                }
+
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(
+                            ReplayMinuteContinuationDelayMilliseconds,
+                            token).ConfigureAwait(false);
+
+                        if (tcs.Task.IsCompleted || token.IsCancellationRequested)
+                            return;
+
+                        // KiwoomApiService의 날짜 종료조건은 변경하지 않는다.
+                        // 기본 수집이 isLast로 끝났는데 선택일에 도달하지 못한 경우에만
+                        // Replay 준비 서비스가 같은 요청 식별자로 다음 페이지(next=2)를 이어간다.
+                        _liveApi.RequestMinuteCandles(
+                            windowId,
+                            code,
+                            minuteScreenNo,
+                            daysToLoad: 10,
+                            maxRows: 0,
+                            priority: 0,
+                            next: 2);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref continuationRequestPending, 0);
+                    }
+                });
+            }
 
             void Handler(string wId, string receivedCode, List<MinuteCandleRecord> candles, bool isLast)
             {
@@ -1748,45 +1943,102 @@ namespace MoneyCreator.Service.Replay
                 if (!string.Equals(receivedCode, code, StringComparison.OrdinalIgnoreCase))
                     return;
 
-                if (candles != null && candles.Count > 0)
+                var pageCandles = candles == null
+                    ? new List<MinuteCandleRecord>()
+                    : candles
+                        .Where(x => x != null && x.CandleTime != DateTime.MinValue)
+                        .ToList();
+
+                DateTime oldestPageTime = pageCandles.Count > 0
+                    ? pageCandles.Min(x => x.CandleTime)
+                    : DateTime.MinValue;
+                DateTime newestPageTime = pageCandles.Count > 0
+                    ? pageCandles.Max(x => x.CandleTime)
+                    : DateTime.MinValue;
+                bool pageContainsTargetDate = pageCandles.Any(x => x.CandleTime.Date == targetDate);
+
+                lock (stateLock)
                 {
-                    // Kiwoom 분봉 응답은 최신 페이지부터 오고,
-                    // KiwoomApiService가 각 페이지 내부를 시간 오름차순으로 전달한다.
-                    // 첫 수신 페이지의 가장 최신 유효 일자가 실제 Replay 거래일이다.
-                    if (firstReceivedTradingDate == DateTime.MinValue)
-                    {
-                        DateTime pageLatestDate = DateTime.MinValue;
+                    receivedPageCount++;
 
-                        foreach (MinuteCandleRecord candle in candles)
-                        {
-                            if (candle == null || candle.CandleTime == DateTime.MinValue)
-                                continue;
+                    if (pageCandles.Count > 0)
+                        rawCandles.AddRange(pageCandles);
 
-                            DateTime candleDate = candle.CandleTime.Date;
-                            if (pageLatestDate == DateTime.MinValue || candleDate > pageLatestDate)
-                                pageLatestDate = candleDate;
-                        }
-
-                        firstReceivedTradingDate = pageLatestDate;
-                    }
-
-                    rawCandles.AddRange(candles.Where(x => x != null));
+                    if (pageContainsTargetDate)
+                        targetDateObserved = true;
                 }
 
-                if (isLast)
-                    tcs.TrySetResult(true);
+                // Kiwoom 기본 연속조회가 아직 진행 중이면 Replay가 중복 next=2를 요청하지 않는다.
+                if (!isLast)
+                    return;
+
+                bool observedTarget;
+                lock (stateLock)
+                    observedTarget = targetDateObserved;
+
+                if (observedTarget)
+                {
+                    Complete("TargetDateObserved");
+                    return;
+                }
+
+                // 목표일보다 과거 페이지까지 내려갔다면 선택일 자체에 분봉이 없는 경우다.
+                if (oldestPageTime != DateTime.MinValue && oldestPageTime.Date < targetDate)
+                {
+                    Complete("TargetDatePassedWithoutRows");
+                    return;
+                }
+
+                string terminalPageSignature = pageCandles.Count == 0
+                    ? "EMPTY"
+                    : string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{0}|{1:yyyyMMddHHmmss}|{2:yyyyMMddHHmmss}",
+                        pageCandles.Count,
+                        newestPageTime,
+                        oldestPageTime);
+
+                int repeatedCount;
+                lock (stateLock)
+                {
+                    if (string.Equals(
+                        lastTerminalPageSignature,
+                        terminalPageSignature,
+                        StringComparison.Ordinal))
+                    {
+                        repeatedTerminalPageCount++;
+                    }
+                    else
+                    {
+                        lastTerminalPageSignature = terminalPageSignature;
+                        repeatedTerminalPageCount = 1;
+                    }
+
+                    repeatedCount = repeatedTerminalPageCount;
+                }
+
+                // 장전의 빈 최초 응답도 바로 실패로 확정하지 않고 next=2를 시도한다.
+                // 다만 동일한 종료 페이지가 반복되면 API 커서가 진행되지 않는 상태이므로 중단한다.
+                if (repeatedCount >= ReplayMinuteMaxRepeatedTerminalPages)
+                {
+                    Complete("TerminalPageRepeated");
+                    return;
+                }
+
+                RequestReplayContinuation();
             }
 
+            // 이전 중단 요청이 남겼을 수 있는 Replay 대상일 공유값을 정리한다.
+            // 이번 수집은 KiwoomApiService의 내부 날짜분기를 사용하지 않고 Replay가 직접 next=2를 관리한다.
+            RemoveRequestedMinuteTargetDate(windowId, code);
             _liveApi.OnMinuteHistoryReceived += Handler;
             try
             {
-                // 날짜를 미리 계산하지 않고 과거분봉 원본을 요청한다.
-                // 실제 첫 수신 일자가 확정된 뒤 그 하루만 남긴다.
                 _liveApi.RequestMinuteCandles(
                     windowId,
                     code,
-                    _liveApi.GetScreenNo(),
-                    daysToLoad: 2,
+                    minuteScreenNo,
+                    daysToLoad: 10,
                     maxRows: 0,
                     priority: 0,
                     next: 0);
@@ -1794,46 +2046,47 @@ namespace MoneyCreator.Service.Replay
                 bool completed = await WaitUntilCompletedAsync(tcs.Task, token).ConfigureAwait(false);
                 if (!completed)
                 {
-                    return new ReplayMinuteCollectResult
-                    {
-                        TradingDate = firstReceivedTradingDate,
-                        Candles = new List<MinuteCandleRecord>()
-                    };
+                    lock (stateLock)
+                        stopReason = "Cancelled";
                 }
             }
             finally
             {
+                RemoveRequestedMinuteTargetDate(windowId, code);
                 _liveApi.OnMinuteHistoryReceived -= Handler;
                 _liveApi.UnregisterWindow(windowId);
             }
 
-            var oneDayCandles = new List<MinuteCandleRecord>();
-            if (firstReceivedTradingDate != DateTime.MinValue)
+            List<MinuteCandleRecord> oneDayCandles;
+            int finalPageCount;
+            string finalStopReason;
+
+            lock (stateLock)
             {
-                foreach (var candle in rawCandles)
-                {
-                    if (candle == null || candle.CandleTime == DateTime.MinValue)
-                        continue;
+                oneDayCandles = rawCandles
+                    .Where(candle =>
+                        candle != null &&
+                        candle.CandleTime != DateTime.MinValue &&
+                        candle.CandleTime.Date == targetDate &&
+                        ReplaySessionOptions.IsReplayDataTimeAllowed(candle.CandleTime, targetDate, false))
+                    .GroupBy(candle => candle.CandleTime)
+                    .Select(group => group.Last())
+                    .OrderBy(candle => candle.CandleTime)
+                    .ToList();
 
-                    if (candle.CandleTime.Date != firstReceivedTradingDate.Date)
-                        continue;
-
-                    if (!ReplaySessionOptions.IsReplayDataTimeAllowed(
-                        candle.CandleTime,
-                        firstReceivedTradingDate,
-                        false))
-                    {
-                        continue;
-                    }
-
-                    oneDayCandles.Add(candle);
-                }
+                finalPageCount = receivedPageCount;
+                finalStopReason = stopReason;
             }
 
             return new ReplayMinuteCollectResult
             {
-                TradingDate = firstReceivedTradingDate,
-                Candles = oneDayCandles
+                TradingDate = targetDate,
+                Candles = oneDayCandles,
+                ReceivedPageCount = finalPageCount,
+                ReplayContinuationRequestCount = Math.Min(
+                    continuationRequestCount,
+                    ReplayMinuteMaxContinuationRequests),
+                StopReason = finalStopReason
             };
         }
 
@@ -2158,12 +2411,12 @@ namespace MoneyCreator.Service.Replay
             if (now.TimeOfDay >= new TimeSpan(15, 40, 0))
                 return now.Date;
 
-            return PreviousBusinessDay(now.Date);
+            return ResolvePreviousBusinessDay(now.Date);
         }
 
-        private static DateTime PreviousBusinessDay(DateTime date)
+        public static DateTime ResolvePreviousBusinessDay(DateTime date)
         {
-            DateTime d = date.AddDays(-1);
+            DateTime d = date.Date.AddDays(-1);
             while (d.DayOfWeek == DayOfWeek.Saturday || d.DayOfWeek == DayOfWeek.Sunday)
                 d = d.AddDays(-1);
             return d.Date;
@@ -2295,7 +2548,7 @@ namespace MoneyCreator.Service.Replay
                         // 이전 tick의 cursor/last DB 호가를 재사용하지 않는다.
                         // 따라서 중간에 DB 호가가 끊긴 구간은 즉시 fallback 호가를 사용한다.
                         var dbHoga = hogaCount > 0
-                            ? FindNearbyHoga(hogaFrames, tick.LastUpdated, 300)
+                            ? FindNearbyHoga(hogaFrames, tick.LastUpdated, 180000)
                             : null;
 
                         bool usedFallbackHoga = dbHoga == null;
@@ -2979,6 +3232,9 @@ namespace MoneyCreator.Service.Replay
         private readonly Dictionary<string, string> _lastFillSkipLogKeyByOrderNo = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private const int ReplayBuyLimitToleranceTicks = 1;
         private const int ReplayPendingBuyCancelSeconds = 3;
+        // Real의 일반 Sell 첫 미체결 확인(4초)과 의미를 맞추되,
+        // Replay에서는 wall-clock/Task.Delay를 사용하지 않고 Tick 실제시간으로만 만료시킨다.
+        private const int ReplayPendingSellCancelSeconds = 4;
 
         public ReplayOrderSimulator(ReplayAccountBook accountBook)
         {
@@ -3077,6 +3333,15 @@ namespace MoneyCreator.Service.Replay
                 double fillPrice = ResolveFillPrice(order, tick, hoga, out skipReason);
                 if (fillPrice <= 0)
                 {
+                    // Replay Sell은 Real의 Task.Delay 기반 감시를 사용하지 않는다.
+                    // 주문 후 4초가 지났고 현재 Tick/호가에서도 여전히 체결 불가능한 경우에만
+                    // Replay Tick 시간으로 원주문을 취소해 장시간 PendingSell 고착을 막는다.
+                    if (ShouldCancelReplayPendingSell(order, tick.LastUpdated))
+                    {
+                        CancelOrder(order.Code, order.OrderNo, order.UntradedQty, tick.LastUpdated, "매도취소(ReplayTime)");
+                        continue;
+                    }
+
                     LogFillSkip(order, tick, hoga, skipReason);
                     continue;
                 }
@@ -3115,6 +3380,23 @@ namespace MoneyCreator.Service.Replay
                 return false;
 
             return (replayTime - orderTime).TotalSeconds >= ReplayPendingBuyCancelSeconds;
+        }
+
+        private static bool ShouldCancelReplayPendingSell(OrderInfo order, DateTime replayTime)
+        {
+            if (order == null || replayTime == DateTime.MinValue)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(order.OrderType) || !order.OrderType.Contains("매도"))
+                return false;
+
+            if (order.UntradedQty <= 0)
+                return false;
+
+            if (!DateTime.TryParse(order.OrderTime, out var orderTime) || orderTime == DateTime.MinValue)
+                return false;
+
+            return (replayTime - orderTime).TotalSeconds >= ReplayPendingSellCancelSeconds;
         }
 
         private void LogFillSkip(OrderInfo order, TrackedSymbol tick, HogaData hoga, string reason)

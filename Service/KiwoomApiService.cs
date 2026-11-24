@@ -1,6 +1,7 @@
 ﻿using AxKHOpenAPILib;
 using MoneyCreator.DataBase;
 using MoneyCreator.Models;
+using MoneyCreator.Service.Replay;
 using MoneyCreator.ViewModels;
 using ScottPlot;
 using System;
@@ -2734,7 +2735,7 @@ namespace MoneyCreator.Service
                 return;
             }
 
-            var candles = new List<MinuteCandleRecord>(count);
+            var pageCandles = new List<MinuteCandleRecord>(count);
 
             await Task.Run(() =>
             {
@@ -2743,45 +2744,69 @@ namespace MoneyCreator.Service
                     if (!TryParseMinuteRow(currentCode, rows[i], out var candle))
                         continue;
 
-                    // 분석용 과거분봉은 전일/당일 각각 09:00:00~15:20:59만 사용한다.
                     if (!IsAnalysisMinuteTime(candle.CandleTime))
                         continue;
 
-                    candles.Add(candle);
+                    pageCandles.Add(candle);
                 }
             });
 
             // 키움 히스토리 TR은 최신→과거 역순으로 내려온다.
             // TR 1회 수신분만 1회 Reverse 후 이후 단계에서는 재정렬하지 않는다.
-            if (candles.Count > 1)
-                candles.Reverse();
+            if (pageCandles.Count > 1)
+                pageCandles.Reverse();
+
+            DateTime explicitTargetDate;
+            bool hasExplicitReplayTarget =
+                ReplayDataPrepareService.TryGetRequestedMinuteTargetDate(
+                    windowId,
+                    currentCode,
+                    out explicitTargetDate);
+
+            var candles = hasExplicitReplayTarget
+                ? pageCandles
+                    .Where(x => x != null && x.CandleTime.Date == explicitTargetDate.Date)
+                    .ToList()
+                : pageCandles;
 
             if (candles.Count > 0)
                 _dbManager.EnqueueMinuteCandles(candles);
 
             bool hasNext = e.sPrevNext == "2";
-
-            bool isMarketOpenNow =
-                DateTime.Now.TimeOfDay >= AnalysisMinuteStartTime &&
-                DateTime.Now.TimeOfDay <= AnalysisMinuteEndTime;
-
-            // 차트/분봉 TR 연속조회 범위는 기존 동작을 유지한다.
-            // 장중에는 요청 daysToLoad 기준, 장마감 후에는 최신 거래일 1일치만 수집한다.
-            // 15:20 컷은 분석/히스토리 시간 필터 역할만 하고, 차트 날짜 기준을 daysToLoad=2로 밀지 않는다.
-            int effectiveDaysToLoad = isMarketOpenNow ? Math.Max(1, daysToLoad) : 1;
-            DateTime targetDate = DateTime.Today.AddDays(-(effectiveDaysToLoad - 1));
-
-            DateTime? oldestDate = candles.Count > 0
-                ? (DateTime?)candles.Min(x => x.CandleTime.Date)
+            DateTime? oldestPageDate = pageCandles.Count > 0
+                ? (DateTime?)pageCandles.Min(x => x.CandleTime.Date)
+                : null;
+            DateTime? newestPageDate = pageCandles.Count > 0
+                ? (DateTime?)pageCandles.Max(x => x.CandleTime.Date)
                 : null;
 
-            bool reachedTargetDate =
-                oldestDate.HasValue &&
-                oldestDate.Value <= targetDate;
+            DateTime targetDate;
+            bool reachedTargetDate;
+            int maxCycle;
 
-            // 같은 날짜 데이터가 계속 들어오는 종목에서 무한 연속조회를 막는 최종 안전장치.
-            // 정상 종료 기준은 날짜 도달이고, maxCycle은 장애 방어용이다.
-            int maxCycle = isMarketOpenNow ? 20 : 5;
+            if (hasExplicitReplayTarget)
+            {
+                targetDate = explicitTargetDate.Date;
+                // 목표일이 현재 페이지에 포함됐거나 이미 더 과거 페이지로 지나갔으면 종료한다.
+                reachedTargetDate =
+                    oldestPageDate.HasValue &&
+                    oldestPageDate.Value <= targetDate;
+                // 최근 최대 10거래일 선택을 지원하되 비정상 페이지 반복은 제한한다.
+                maxCycle = 40;
+            }
+            else
+            {
+                bool isMarketOpenNow =
+                    DateTime.Now.TimeOfDay >= AnalysisMinuteStartTime &&
+                    DateTime.Now.TimeOfDay <= AnalysisMinuteEndTime;
+
+                int effectiveDaysToLoad = isMarketOpenNow ? Math.Max(1, daysToLoad) : 1;
+                targetDate = DateTime.Today.AddDays(-(effectiveDaysToLoad - 1));
+                reachedTargetDate =
+                    oldestPageDate.HasValue &&
+                    oldestPageDate.Value <= targetDate;
+                maxCycle = isMarketOpenNow ? 20 : 5;
+            }
 
             bool canRequestNext =
                 hasNext &&
@@ -2799,8 +2824,10 @@ namespace MoneyCreator.Service
             OnLog?.Invoke(
                 windowId,
                 $"[MINUTE_DEBUG] code={currentCode}, cycle={cycle}/{maxCycle}, prevNext={e.sPrevNext}, " +
-                $"target={targetDate:yyyyMMdd}, oldest={(oldestDate.HasValue ? oldestDate.Value.ToString("yyyyMMdd") : "NONE")}, " +
-                $"reached={reachedTargetDate}, canNext={canRequestNext}, rows={candles.Count}, screen={screenNo}");
+                $"mode={(hasExplicitReplayTarget ? "ReplayTarget" : "Default")}, target={targetDate:yyyyMMdd}, " +
+                $"newest={(newestPageDate.HasValue ? newestPageDate.Value.ToString("yyyyMMdd") : "NONE")}, " +
+                $"oldest={(oldestPageDate.HasValue ? oldestPageDate.Value.ToString("yyyyMMdd") : "NONE")}, " +
+                $"targetRows={candles.Count}, reached={reachedTargetDate}, canNext={canRequestNext}, screen={screenNo}");
 
             if (canRequestNext)
             {
